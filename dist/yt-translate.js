@@ -1,4 +1,4 @@
-/* YT Loon 1.0.3. Generated: edit src/, run npm run build. */
+/* YT Loon 1.0.4. Generated: edit src/, run npm run build. */
 /* Original implementation. No dependencies; shared by Node tests and Loon bundles. */
 var YTSubs = (function () {
   "use strict";
@@ -21,7 +21,10 @@ var YTSubs = (function () {
     try { return m ? decodeURIComponent(m[1].replace(/\+/g, " ")) : ""; } catch (_) { return ""; }
   }
   function statusOK(response) { return Number(response && response.status) === 200; }
-  function bilingual(source, translated) { return clean(translated) + "\n" + source; }
+  // Source line breaks would stack under the translation; let the player wrap instead.
+  function bilingual(source, translated) { return clean(translated) + "\n" + source.replace(/\s+/g, " "); }
+  // CJK glyphs take about two Latin columns on screen.
+  function width(s) { return s.replace(/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g, "xx").length; }
   function centerAnchor(value) {
     var n = value === undefined || value === null ? 7 : Number(value);
     return Number.isInteger(n) && n >= 0 && n <= 8 ? Math.floor(n / 3) * 3 + 1 : 7;
@@ -139,7 +142,7 @@ var YTSubs = (function () {
     }) || timed < 3) return original;
     var tokens = [];
     events.forEach(function (e) { e.segs.forEach(function (s) {
-      if (s.utf8.trim()) tokens.push({text: s.utf8, start: e.tStartMs + (s.tOffsetMs || 0), end: e.tStartMs + e.dDurationMs});
+      if (s.utf8.trim()) tokens.push({text: s.utf8.replace(/\s+/g, " "), start: e.tStartMs + (s.tOffsetMs || 0), end: e.tStartMs + e.dDurationMs});
     }); });
     // Repeated/overlapping word timestamps need a track-specific deduplicator.
     if (tokens.some(function (t, i) { return i && t.start <= tokens[i - 1].start; })) return original;
@@ -148,13 +151,17 @@ var YTSubs = (function () {
       if (!current) return;
       rebuilt.push({tStartMs: current.start, dDurationMs: Math.max(1, end - current.start), segs: [{utf8: current.text.trim()}]}); current = null;
     }
+    // Translation sits above the source, so a whole long sentence covers a phone-sized
+    // player. Past MIN_CUE prefer clause breaks; MAX_CUE/MAX_CUE_MS are hard limits.
+    var MIN_CUE = 45, MAX_CUE = 90, MAX_CUE_MS = 8000;
+    var CLAUSE_START = /^\s*(?:and|but|or|so|because|which|while|when|whereas|although|though|since|unless|if)\b/i;
     tokens.forEach(function (t, i) {
-      var previous = tokens[i - 1];
-      if (current && (t.start - current.start >= 12000 || current.text.length + t.text.length > 240 || previous.end + 1500 < t.start)) flush(Math.min(previous.end, t.start));
+      var previous = tokens[i - 1], size = current ? width(current.text) : 0;
+      if (current && (t.start - current.start >= MAX_CUE_MS || size + width(t.text) > MAX_CUE || previous.end + 1500 < t.start || (size >= MIN_CUE && CLAUSE_START.test(t.text)))) flush(Math.min(previous.end, t.start));
       if (!current) current = {start: t.start, text: ""};
       current.text += (current.text && !/\s$/.test(current.text) && !/^\s|^[,.;:!?]/.test(t.text) ? " " : "") + t.text;
       var next = tokens[i + 1];
-      if (/[.!?]["'’”)]*\s*$/.test(t.text) || !next) flush(next ? Math.min(t.end, next.start) : t.end);
+      if (/[.!?]["'’”)]*\s*$/.test(t.text) || (width(current.text) >= MIN_CUE && /[,;:]["'’”)]*\s*$/.test(t.text)) || !next) flush(next ? Math.min(t.end, next.start) : t.end);
     });
     var normalized = {events: rebuilt};
     var result = parse(JSON.stringify(normalized));
@@ -398,7 +405,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
       saveCache();
       if (!prewarm && doc && Object.keys(translations).length) response = {body: doc.render(translations), headers: YTSubs.headers(responseContext.headers)};
     } catch (_) { response = {}; reason = "OUTPUT_ERROR"; }
-    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " version=1.0.3 elapsed_ms=" + (Date.now() - started));
+    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " version=1.0.4 elapsed_ms=" + (Date.now() - started));
     $done(response);
   }
   try {
