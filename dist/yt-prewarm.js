@@ -1,4 +1,4 @@
-/* YT Loon 1.0.4. Generated: edit src/, run npm run build. */
+/* YT Loon 1.0.5. Generated: edit src/, run npm run build. */
 /* Original implementation. No dependencies; shared by Node tests and Loon bundles. */
 var YTSubs = (function () {
   "use strict";
@@ -25,6 +25,16 @@ var YTSubs = (function () {
   function bilingual(source, translated) { return clean(translated) + "\n" + source.replace(/\s+/g, " "); }
   // CJK glyphs take about two Latin columns on screen.
   function width(s) { return s.replace(/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g, "xx").length; }
+  function primaryLanguage(code) { return String(code || "").toLowerCase().split(/[-_]/)[0]; }
+  // zh-Hans/zh-Hant/zh-TW/zh all share "zh". For a Chinese target, a mostly-Han track
+  // without kana is Chinese whatever its (possibly missing) language code says.
+  function sameLanguage(source, target, cues) {
+    if (primaryLanguage(source) === primaryLanguage(target)) return true;
+    if (primaryLanguage(target) !== "zh") return false;
+    var text = cues.map(function (c) { return c.text; }).join("");
+    var han = (text.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g) || []).length, kana = (text.match(/[\u3040-\u30ff]/g) || []).length;
+    return han > 0 && kana * 20 < han && han >= (text.match(/[A-Za-z]/g) || []).length;
+  }
   function centerAnchor(value) {
     var n = value === undefined || value === null ? 7 : Number(value);
     return Number.isInteger(n) && n >= 0 && n <= 8 ? Math.floor(n / 3) * 3 + 1 : 7;
@@ -341,7 +351,7 @@ var YTSubs = (function () {
     return found;
   }
   function utf8size(s) { return encodeURIComponent(s).replace(/%[A-F\d]{2}/gi, "x").length; }
-  return {URL_RE: URL_RE, parse: parse, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size};
+  return {URL_RE: URL_RE, parse: parse, sameLanguage: sameLanguage, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size};
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
 
@@ -406,7 +416,7 @@ var YTSubsPrewarm = true;
       saveCache();
       if (!prewarm && doc && Object.keys(translations).length) response = {body: doc.render(translations), headers: YTSubs.headers(responseContext.headers)};
     } catch (_) { response = {}; reason = "OUTPUT_ERROR"; }
-    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " version=1.0.4 elapsed_ms=" + (Date.now() - started));
+    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " version=1.0.5 elapsed_ms=" + (Date.now() - started));
     $done(response);
   }
   try {
@@ -428,7 +438,7 @@ var YTSubsPrewarm = true;
     if (!/^[a-zA-Z0-9-]{2,32}$/.test(cfg.target) || !/^[a-zA-Z0-9._-]{1,64}$/.test(cfg.model)) return finish("BAD_CONFIG");
     cfg.start_seconds = 0; // Ignore obsolete local/plugin start offsets.
     var source = YTSubs.query(requestContext.url, "tlang") || YTSubs.query(requestContext.url, "lang") || "auto";
-    if (source.toLowerCase() === cfg.target.toLowerCase()) return finish("SAME_LANGUAGE");
+    if (YTSubs.sameLanguage(source, cfg.target, doc.cues)) return finish("SAME_LANGUAGE");
     var cache = Object.create(null);
     loadCache().forEach(function (r) { cache[r.k] = r.v; });
     function cacheKey(c) { return JSON.stringify([doc.sentenceMode && doc.format === "srv3" ? "prompt-srv3-sentence-v1" : "prompt-v1", cfg.model, cfg.target, source, c.text]); }

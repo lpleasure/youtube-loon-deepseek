@@ -24,6 +24,16 @@ var YTSubs = (function () {
   function bilingual(source, translated) { return clean(translated) + "\n" + source.replace(/\s+/g, " "); }
   // CJK glyphs take about two Latin columns on screen.
   function width(s) { return s.replace(/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g, "xx").length; }
+  function primaryLanguage(code) { return String(code || "").toLowerCase().split(/[-_]/)[0]; }
+  // zh-Hans/zh-Hant/zh-TW/zh all share "zh". For a Chinese target, a mostly-Han track
+  // without kana is Chinese whatever its (possibly missing) language code says.
+  function sameLanguage(source, target, cues) {
+    if (primaryLanguage(source) === primaryLanguage(target)) return true;
+    if (primaryLanguage(target) !== "zh") return false;
+    var text = cues.map(function (c) { return c.text; }).join("");
+    var han = (text.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g) || []).length, kana = (text.match(/[\u3040-\u30ff]/g) || []).length;
+    return han > 0 && kana * 20 < han && han >= (text.match(/[A-Za-z]/g) || []).length;
+  }
   function centerAnchor(value) {
     var n = value === undefined || value === null ? 7 : Number(value);
     return Number.isInteger(n) && n >= 0 && n <= 8 ? Math.floor(n / 3) * 3 + 1 : 7;
@@ -340,6 +350,6 @@ var YTSubs = (function () {
     return found;
   }
   function utf8size(s) { return encodeURIComponent(s).replace(/%[A-F\d]{2}/gi, "x").length; }
-  return {URL_RE: URL_RE, parse: parse, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size};
+  return {URL_RE: URL_RE, parse: parse, sameLanguage: sameLanguage, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size};
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;

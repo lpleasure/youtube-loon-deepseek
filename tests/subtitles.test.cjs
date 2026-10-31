@@ -688,6 +688,22 @@ test('bilingual output collapses source line breaks below the translation',()=>{
  const body='<timedtext format="3"><body><p t="0" d="3000">First line<br/>second line</p></body></timedtext>';
  assert.equal(C.parse(C.parse(body).render({0:'第一行第二行'})).cues[0].text,'第一行第二行\nFirst line second line');
 });
+test('Simplified and Traditional Chinese tracks pass through without translation',()=>{
+ const zh=JSON.stringify({events:[{tStartMs:0,dDurationMs:2000,segs:[{utf8:'這是繁體中文字幕。'}]},{tStartMs:2000,dDurationMs:2000,segs:[{utf8:'这是简体中文 iPhone 字幕。'}]}]});
+ for(const lang of ['zh-Hans','zh-Hant','zh-TW','zh-HK','zh-CN','zh','zh_TW']){
+  const h=harness('translate',{body:zh,url:requestURL.replace('lang=en','lang='+lang)});
+  assert.equal(h.calls.length,0);assert.deepEqual(h.results,[{}]);assert.ok(h.logs.some(s=>s.includes('result=SAME_LANGUAGE')));
+ }
+ // Missing or mislabeled language codes fall back to the track text.
+ for(const url of [requestURL,requestURL.replace('lang=en','lang=auto'),requestURL.replace('lang=en&','')]) assert.equal(harness('translate',{body:zh,url}).calls.length,0);
+ assert.equal(harness('translate',{body:zh,url:requestURL.replace('lang=en','lang=zh-Hant'),args:{enabled:true,target:'ja'}}).calls.length,1);
+});
+test('Japanese and English tracks still translate; YouTube Chinese auto-translation passes through',()=>{
+ const ja=JSON.stringify({events:[{tStartMs:0,dDurationMs:2000,segs:[{utf8:'これは日本語の字幕です。'}]}]});
+ assert.equal(harness('translate',{body:ja,url:requestURL.replace('lang=en','lang=ja')}).calls.length,1);
+ assert.equal(harness('translate',{}).calls.length,1);
+ assert.equal(harness('translate',{body:ja,url:requestURL.replace('lang=en','lang=ja&tlang=zh-Hant')}).calls.length,0);
+});
 test('SRV3 multiple windows fall back without merging separate speakers',()=>{
  const body=srvSentences().replace('t="92000"','w="1" t="92000"').replace('t="96000"','w="2" t="96000"');
  const d=C.sentenceParse(body);assert.equal(d.sentenceMode,'fallback_multiwindow');assert.deepEqual(d.cues,C.parse(body).cues);
