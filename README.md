@@ -1,4 +1,4 @@
-# YouTube DeepSeek 1.0.3
+# YouTube DeepSeek 1.0.4
 
 正式版。关闭旧插件，安装 plugins/YouTube-translate.plugin，更新脚本并开启翻译。需要 Loon 3.5.1(983)+。Key 和缓存继续保留。新用户在手机本地运行 local-setup.example.js 配置 Key。
 

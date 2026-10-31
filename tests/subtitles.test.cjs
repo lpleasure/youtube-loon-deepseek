@@ -665,6 +665,29 @@ test('SRV3 new sentence cache namespace bypasses old translations without cleari
  assert.ok(h.store['ytloon.deepseek.key']);assert.ok(JSON.parse(h.store['ytloon.cache.v1']).some(r=>r.v==='OLD_TRANSLATION'));
  const replay=harness('translate',{body,store:h.store});assert.equal(replay.calls.length,0);assert.ok(replay.results[0].body.includes('译文'));
 });
+function longSentence() {
+ // Manual-caption style: one long sentence with source line breaks inside cues.
+ const words='Not that the current mini-LED\nMac Pros looked bad ever, but this one gets you that crazy 10 million\nto 1 contrast ratio because what OLED has always been good at is pitch-black blacks...'.split(/(?<=\s)/);
+ return JSON.stringify({events:[0,1].map(k=>{const part=words.slice(k*20,k*20+20);return {tStartMs:k*5000,dDurationMs:5000,segs:part.map((w,j)=>({utf8:w,tOffsetMs:j*200}))};})});
+}
+test('long sentences split at clauses so bilingual cues fit a phone player',()=>{
+ const d=C.sentenceParse(longSentence());assert.equal(d.sentenceMode,'json3_wordtimed');
+ assert.deepEqual(d.cues.map(c=>c.text),['Not that the current mini-LED Mac Pros looked bad ever,','but this one gets you that crazy 10 million to 1 contrast ratio','because what OLED has always been good at is pitch-black blacks...']);
+ for(const c of d.cues){assert.ok(c.text.length<=90);assert.equal(c.text.includes('\n'),false);}
+});
+test('sentence cues obey hard width and duration limits without punctuation',()=>{
+ const segs=Array.from({length:60},(_,j)=>({utf8:'word ',tOffsetMs:j*100}));
+ const d=C.sentenceParse(JSON.stringify({events:[{tStartMs:0,dDurationMs:6000,segs}]}));
+ assert.ok(d.cues.length>=4);for(const c of d.cues) assert.ok(c.text.length<=90);
+ const slow=Array.from({length:6},(_,j)=>({tStartMs:j*3000,dDurationMs:3000,segs:[{utf8:'a ',tOffsetMs:0},{utf8:'b ',tOffsetMs:1000}]}));
+ assert.deepEqual(C.sentenceParse(JSON.stringify({events:slow})).cues.map(c=>[c.startSeconds,c.text]),[[0,'a b a b a b'],[9,'a b a b a b']]);
+ const cjk=Array.from({length:40},(_,j)=>({utf8:'字字',tOffsetMs:j*100}));
+ assert.ok(C.sentenceParse(JSON.stringify({events:[{tStartMs:0,dDurationMs:5000,segs:cjk}]})).cues.every(c=>c.text.replace(/ /g,'').length*2<=90));
+});
+test('bilingual output collapses source line breaks below the translation',()=>{
+ const body='<timedtext format="3"><body><p t="0" d="3000">First line<br/>second line</p></body></timedtext>';
+ assert.equal(C.parse(C.parse(body).render({0:'第一行第二行'})).cues[0].text,'第一行第二行\nFirst line second line');
+});
 test('SRV3 multiple windows fall back without merging separate speakers',()=>{
  const body=srvSentences().replace('t="92000"','w="1" t="92000"').replace('t="96000"','w="2" t="96000"');
  const d=C.sentenceParse(body);assert.equal(d.sentenceMode,'fallback_multiwindow');assert.deepEqual(d.cues,C.parse(body).cues);
