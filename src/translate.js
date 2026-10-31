@@ -58,7 +58,7 @@
       saveCache();
       if (!prewarm && doc && Object.keys(translations).length) response = {body: doc.render(translations), headers: YTSubs.headers(responseContext.headers)};
     } catch (_) { response = {}; reason = "OUTPUT_ERROR"; }
-    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " version=1.0.4 elapsed_ms=" + (Date.now() - started));
+    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " version=1.0.5 elapsed_ms=" + (Date.now() - started));
     $done(response);
   }
   try {
@@ -80,7 +80,7 @@
     if (!/^[a-zA-Z0-9-]{2,32}$/.test(cfg.target) || !/^[a-zA-Z0-9._-]{1,64}$/.test(cfg.model)) return finish("BAD_CONFIG");
     cfg.start_seconds = 0; // Ignore obsolete local/plugin start offsets.
     var source = YTSubs.query(requestContext.url, "tlang") || YTSubs.query(requestContext.url, "lang") || "auto";
-    if (source.toLowerCase() === cfg.target.toLowerCase()) return finish("SAME_LANGUAGE");
+    if (YTSubs.sameLanguage(source, cfg.target, doc.cues)) return finish("SAME_LANGUAGE");
     var cache = Object.create(null);
     loadCache().forEach(function (r) { cache[r.k] = r.v; });
     function cacheKey(c) { return JSON.stringify([doc.sentenceMode && doc.format === "srv3" ? "prompt-srv3-sentence-v1" : "prompt-v1", cfg.model, cfg.target, source, c.text]); }
