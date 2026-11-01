@@ -744,10 +744,39 @@ test('sentence cues obey hard width and duration limits without punctuation',()=
  const segs=Array.from({length:60},(_,j)=>({utf8:'word ',tOffsetMs:j*100}));
  const d=C.sentenceParse(JSON.stringify({events:[{tStartMs:0,dDurationMs:6000,segs}]}));
  assert.ok(d.cues.length>=4);for(const c of d.cues) assert.ok(c.text.length<=90);
+ // A slow sentence that fits the width stays whole; only pauses and the 45s bound end it.
  const slow=Array.from({length:6},(_,j)=>({tStartMs:j*3000,dDurationMs:3000,segs:[{utf8:'a ',tOffsetMs:0},{utf8:'b ',tOffsetMs:1000}]}));
- assert.deepEqual(C.sentenceParse(JSON.stringify({events:slow})).cues.map(c=>[c.startSeconds,c.text]),[[0,'a b a b a b'],[9,'a b a b a b']]);
+ assert.deepEqual(C.sentenceParse(JSON.stringify({events:slow})).cues.map(c=>[c.startSeconds,c.text]),[[0,'a b a b a b a b a b a b']]);
+ const endless=Array.from({length:30},(_,j)=>({tStartMs:j*2000,dDurationMs:2000,segs:[{utf8:'w ',tOffsetMs:0},{utf8:'x ',tOffsetMs:1000}]}));
+ assert.ok(C.sentenceParse(JSON.stringify({events:endless})).cues.every((c,i,a)=>!a[i+1]||a[i+1].startSeconds-c.startSeconds<=45));
  const cjk=Array.from({length:40},(_,j)=>({utf8:'字字',tOffsetMs:j*100}));
  assert.ok(C.sentenceParse(JSON.stringify({events:[{tStartMs:0,dDurationMs:5000,segs:cjk}]})).cues.every(c=>c.text.replace(/ /g,'').length*2<=90));
+});
+function wordTrack(text) {
+ const w=text.split(/(?<=\s)/);
+ return JSON.stringify({events:[{tStartMs:0,dDurationMs:w.length*300+300,segs:w.map((x,j)=>({utf8:x,tOffsetMs:j*300}))}]});
+}
+const leadsOn=/^(?:i|a|an|the|to|of|my|your|and|or|but|is|was|that|in|on|for|with)$/i;
+test('sentences that fit the width are never split, even with commas',()=>{
+ for(const s of ['Honestly, I love you.','Well, if you ask me, this is the best phone I have used all year.']){
+  assert.deepEqual(C.sentenceParse(wordTrack(s)).cues.map(c=>c.text),[s]);
+ }
+});
+test('long sentences split evenly at natural breaks and never end a cue on a leading word',()=>{
+ for(const s of [
+  'After all of these years of waiting and hoping and wondering what I would say to you I really love you more than words can say.',
+  'I think the most important thing about this phone is that it finally fixes the battery problem that everyone has been complaining about for years.',
+  'so what we did was we took the camera apart and we found that the sensor is actually the same one from last year but the processing is completely different and that changes everything'
+ ]){
+  const cues=C.sentenceParse(wordTrack(s)).cues;
+  assert.ok(cues.length>=2); assert.equal(cues.map(c=>c.text).join(' '),s);
+  for(const c of cues){ assert.ok(c.text.length<=90); assert.ok(c.text.length>=35); assert.equal(leadsOn.test(c.text.split(' ').pop().replace(/[.,]$/,'')),false,c.text); }
+ }
+ assert.ok(C.sentenceParse(wordTrack('After all of these years of waiting and hoping and wondering what I would say to you I really love you more than words can say.')).cues.some(c=>c.text.includes('I really love you')));
+});
+test('split pieces share the sentence interval back to back',()=>{
+ const cues=JSON.parse(C.sentenceParse(wordTrack('I think the most important thing about this phone is that it finally fixes the battery problem that everyone has been complaining about for years.')).render({0:'甲',1:'乙'})).events;
+ assert.equal(cues[0].tStartMs+cues[0].dDurationMs,cues[1].tStartMs);
 });
 test('bilingual output collapses source line breaks below the translation',()=>{
  const body='<timedtext format="3"><body><p t="0" d="3000">First line<br/>second line</p></body></timedtext>';
