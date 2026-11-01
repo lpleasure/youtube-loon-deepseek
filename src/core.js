@@ -349,7 +349,32 @@ var YTSubs = (function () {
     });
     return found;
   }
-  function utf8size(s) { return encodeURIComponent(s).replace(/%[A-F\d]{2}/gi, "x").length; }
-  return {URL_RE: URL_RE, parse: parse, sameLanguage: sameLanguage, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size};
+  // Counted in place: snapshots can be several MB and an encoded copy would triple that.
+  function utf8size(s) {
+    var n = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c < 0x80) n += 1;
+      else if (c < 0x800) n += 2;
+      else if (c >= 0xd800 && c <= 0xdbff && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) { n += 4; i++; }
+      else n += 3;
+    }
+    return n;
+  }
+  // 53-bit string hash (cyrb53) for compact cache keys; collisions within one track are negligible.
+  function hash(s) {
+    var h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (var i = 0; i < s.length; i++) { var c = s.charCodeAt(i); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+  }
+  // One cache shard per video; tracks without a usable video ID fall back to their text.
+  function trackID(url, cues) {
+    var v = query(url, "v");
+    if (/^[A-Za-z0-9_-]{6,64}$/.test(v)) return "v" + v;
+    return "h" + hash(cues.slice(0, 200).map(function (c) { return c.text; }).join("\n"));
+  }
+  return {URL_RE: URL_RE, parse: parse, sameLanguage: sameLanguage, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size, hash: hash, trackID: trackID};
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;

@@ -1,4 +1,4 @@
-/* YT Loon 1.0.5. Generated: edit src/, run npm run build. */
+/* YT Loon 1.1.0. Generated: edit src/, run npm run build. */
 /* Original implementation. No dependencies; shared by Node tests and Loon bundles. */
 var YTSubs = (function () {
   "use strict";
@@ -350,8 +350,33 @@ var YTSubs = (function () {
     });
     return found;
   }
-  function utf8size(s) { return encodeURIComponent(s).replace(/%[A-F\d]{2}/gi, "x").length; }
-  return {URL_RE: URL_RE, parse: parse, sameLanguage: sameLanguage, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size};
+  // Counted in place: snapshots can be several MB and an encoded copy would triple that.
+  function utf8size(s) {
+    var n = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c < 0x80) n += 1;
+      else if (c < 0x800) n += 2;
+      else if (c >= 0xd800 && c <= 0xdbff && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) { n += 4; i++; }
+      else n += 3;
+    }
+    return n;
+  }
+  // 53-bit string hash (cyrb53) for compact cache keys; collisions within one track are negligible.
+  function hash(s) {
+    var h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (var i = 0; i < s.length; i++) { var c = s.charCodeAt(i); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+  }
+  // One cache shard per video; tracks without a usable video ID fall back to their text.
+  function trackID(url, cues) {
+    var v = query(url, "v");
+    if (/^[A-Za-z0-9_-]{6,64}$/.test(v)) return "v" + v;
+    return "h" + hash(cues.slice(0, 200).map(function (c) { return c.text; }).join("\n"));
+  }
+  return {URL_RE: URL_RE, parse: parse, sameLanguage: sameLanguage, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size, hash: hash, trackID: trackID};
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
 
@@ -360,9 +385,13 @@ var YTSubsPrewarm = true;
   "use strict";
   var prewarm = typeof YTSubsPrewarm !== "undefined" && YTSubsPrewarm;
   var requestContext = typeof $request !== "undefined" ? $request : {}, responseContext = typeof $response !== "undefined" ? $response : {};
-  var snapshot, SNAPSHOT = "ytloon.pending.v1";
-  var CACHE = "ytloon.cache.v1", SETTINGS = "ytloon.settings.v1", KEY = "ytloon.deepseek.key", COOLDOWN = "ytloon.cooldown.v1";
-  var done = false, timer, doc, translations = {}, additions = [], started = Date.now();
+  var snapshot, SNAPSHOT = "ytloon.pending.v1", SNAPSHOT_ID = "ytloon.pendingid.v1";
+  var SETTINGS = "ytloon.settings.v1", KEY = "ytloon.deepseek.key", COOLDOWN = "ytloon.cooldown.v1";
+  // One shard per video keeps each run's cache work proportional to that video, not the
+  // whole history; the small index only tracks expiry and size for eviction.
+  var LEGACY_CACHE = "ytloon.cache.v1", INDEX = "ytloon.index.v2", SHARD = "ytloon.shard.v2.", LOCK = "ytloon.lock.v2.";
+  var CACHE_TTL = 7 * 86400000, CACHE_BUDGET = 6291456, MAX_SHARDS = 400, CHECKPOINT = 96, WAIT_MS = 1000;
+  var done = false, timer, doc, track, lockValue, stored, translations = {}, additions = [], started = Date.now(), waitedMS = 0, trackEntries = 0;
   var counts = {cached: 0, sent: 0, translated: 0, failed: 0};
   var DEADLINE_MS = prewarm ? 270000 : 22000, REQUEST_MS = prewarm ? 30000 : 12000, MIN_REQUEST_MS = 4000, RETRY_MS = 750, MAX_CALLS = 4, concurrency = 8;
   function remaining() { return DEADLINE_MS - 500 - (Date.now() - started); }
@@ -390,22 +419,53 @@ var YTSubsPrewarm = true;
   function write(key, value) { try { return $persistentStore.write(value, key); } catch (_) { return false; } }
   function readJSON(key, fallback) { try { return JSON.parse(read(key)) || fallback; } catch (_) { return fallback; } }
   function log(message) { console.log("[YTSubs translate] " + message); }
-  function loadCache() {
-    var now = Date.now(), a = readJSON(CACHE, []);
-    if (!Array.isArray(a)) return [];
-    return a.filter(function (r) { return r && typeof r.k === "string" && typeof r.v === "string" && r.v.length <= 1600 && r.expires > now; });
+  function readIndex() {
+    var index = readJSON(INDEX, null);
+    return index && typeof index === "object" && index.s && typeof index.s === "object" ? index : {s: {}};
   }
-  function saveCache() {
-    if (!additions.length) return;
-    // Reload before merge to reduce lost updates; Loon storage has no transaction API.
-    var entries = loadCache(), latest = Object.create(null);
-    entries.concat(additions).forEach(function (r) { latest[r.k] = r; });
-    entries = Object.keys(latest).map(function (k) { return latest[k]; }).sort(function (a, b) { return a.expires - b.expires; }).slice(-20000);
-    var sizes = entries.map(function (r) { return YTSubs.utf8size(JSON.stringify(r)); });
-    var bytes = sizes.reduce(function (sum, n) { return sum + n; }, 2 + Math.max(0, entries.length - 1));
-    while (entries.length && bytes > 16777216) { bytes -= sizes.shift() + (entries.length > 1 ? 1 : 0); entries.shift(); }
-    if (!write(CACHE, JSON.stringify(entries))) log("cache_write_failed");
-    else additions = [];
+  function retireLegacyCache() {
+    // The pre-1.1 single-key cache could hold MBs; delete it without ever reading it.
+    var index = readIndex();
+    if (index.m) return;
+    write(LEGACY_CACHE, undefined);
+    index.m = 1;
+    write(INDEX, JSON.stringify(index));
+  }
+  function loadShard() {
+    var shard = readJSON(SHARD + track, null), entries = Object.create(null);
+    if (!shard || !(shard.e > Date.now()) || !shard.t || typeof shard.t !== "object") return entries;
+    Object.keys(shard.t).forEach(function (k) {
+      if (typeof shard.t[k] === "string" && shard.t[k].length <= 1600) entries[k] = shard.t[k];
+    });
+    return entries;
+  }
+  function updateIndex(bytes) {
+    var index = readIndex(), now = Date.now();
+    index.s[track] = [now + CACHE_TTL, bytes];
+    var ids = Object.keys(index.s).filter(function (id) {
+      var r = index.s[id];
+      if (Array.isArray(r) && r[0] > now && r[1] >= 0) return true;
+      write(SHARD + id, undefined); delete index.s[id]; return false;
+    }).sort(function (a, b) { return index.s[a][0] - index.s[b][0]; });
+    var total = ids.reduce(function (sum, id) { return sum + index.s[id][1]; }, 0);
+    // Oldest shards go first; the shard just written has the newest expiry and stays.
+    while (ids.length > 1 && (total > CACHE_BUDGET || ids.length > MAX_SHARDS)) {
+      var id = ids.shift(); total -= index.s[id][1]; write(SHARD + id, undefined); delete index.s[id];
+    }
+    if (!write(INDEX, JSON.stringify(index))) log("index_write_failed");
+  }
+  function saveCache(reload) {
+    if (!additions.length || !track) return;
+    // Checkpoints reuse the shard already in memory (the lock keeps other runs from writing it);
+    // the final save reloads once to keep entries a racing execution saved. No transactions in Loon.
+    var entries = reload || !stored ? loadShard() : stored;
+    additions.forEach(function (r) { entries[r.k] = r.v; });
+    stored = entries;
+    var text = JSON.stringify({e: Date.now() + CACHE_TTL, t: entries});
+    if (!write(SHARD + track, text)) { log("cache_write_failed"); return; }
+    additions = [];
+    trackEntries = Object.keys(entries).length;
+    updateIndex(YTSubs.utf8size(text));
   }
   function finish(reason) {
     if (done) return;
@@ -413,16 +473,17 @@ var YTSubsPrewarm = true;
     if (timer && typeof clearTimeout === "function") clearTimeout(timer);
     var response = {};
     try {
-      saveCache();
+      saveCache(true);
       if (!prewarm && doc && Object.keys(translations).length) response = {body: doc.render(translations), headers: YTSubs.headers(responseContext.headers)};
     } catch (_) { response = {}; reason = "OUTPUT_ERROR"; }
-    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " version=1.0.5 elapsed_ms=" + (Date.now() - started));
+    if (lockValue && read(LOCK + track) === lockValue) write(LOCK + track, undefined);
+    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " version=1.1.0 elapsed_ms=" + (Date.now() - started));
     $done(response);
   }
   try {
     if (prewarm) {
       snapshot = readJSON(SNAPSHOT, null);
-      if (!snapshot || snapshot.expires <= Date.now() || typeof snapshot.body !== "string" || !snapshot.cfg || typeof snapshot.source !== "string") return finish("NO_PENDING_TRACK");
+      if (!snapshot || snapshot.expires <= Date.now() || typeof snapshot.body !== "string" || !snapshot.cfg || typeof snapshot.source !== "string" || typeof snapshot.track !== "string") return finish("NO_PENDING_TRACK");
       requestContext = {url: "https://www.youtube.com/api/timedtext?lang=" + encodeURIComponent(snapshot.source)};
       responseContext = {status: 200, body: snapshot.body, headers: {}};
     }
@@ -439,38 +500,77 @@ var YTSubsPrewarm = true;
     cfg.start_seconds = 0; // Ignore obsolete local/plugin start offsets.
     var source = YTSubs.query(requestContext.url, "tlang") || YTSubs.query(requestContext.url, "lang") || "auto";
     if (YTSubs.sameLanguage(source, cfg.target, doc.cues)) return finish("SAME_LANGUAGE");
-    var cache = Object.create(null);
-    loadCache().forEach(function (r) { cache[r.k] = r.v; });
-    function cacheKey(c) { return JSON.stringify([doc.sentenceMode && doc.format === "srv3" ? "prompt-srv3-sentence-v1" : "prompt-v1", cfg.model, cfg.target, source, c.text]); }
-    var missing = [], unique = Object.create(null), aliases = Object.create(null);
-    doc.cues.forEach(function (c) {
-      c.key = cacheKey(c);
-      if (cache[c.key]) { translations[c.id] = cache[c.key]; counts.cached++; }
-      else if (c.text.length <= 800 && c.startSeconds >= cfg.start_seconds) {
-        if (unique[c.key] !== undefined) aliases[unique[c.key]].push(c.id);
-        else { unique[c.key] = c.id; aliases[c.id] = [c.id]; missing.push(c); }
-      }
-    });
-    if (!prewarm && missing.length) {
-      var pendingTrack = JSON.stringify({body: responseContext.body, source: source, cfg: {target: cfg.target, model: cfg.model, concurrency: concurrency}, expires: Date.now() + 1800000});
-      if (YTSubs.utf8size(pendingTrack) > 16777216) { write(SNAPSHOT, undefined); log("pending_body_limit"); }
-      else if (!write(SNAPSHOT, pendingTrack)) log("pending_write_failed");
+    track = prewarm ? snapshot.track : YTSubs.trackID(requestContext.url, doc.cues);
+    retireLegacyCache();
+    var namespace = doc.sentenceMode && doc.format === "srv3" ? "prompt-srv3-sentence-v1" : "prompt-v1";
+    doc.cues.forEach(function (c) { c.key = YTSubs.hash(JSON.stringify([namespace, cfg.model, cfg.target, source, c.text])); });
+    var missing = [], aliases = Object.create(null);
+    function collect(entries) {
+      var unique = Object.create(null);
+      missing = []; aliases = Object.create(null); stored = entries;
+      doc.cues.forEach(function (c) {
+        if (translations[c.id]) return;
+        if (entries[c.key]) { translations[c.id] = entries[c.key]; counts.cached++; }
+        else if (c.text.length <= 800 && c.startSeconds >= cfg.start_seconds) {
+          if (unique[c.key] !== undefined) aliases[unique[c.key]].push(c.id);
+          else { unique[c.key] = c.id; aliases[c.id] = [c.id]; missing.push(c); }
+        }
+      });
+      trackEntries = Math.max(trackEntries, Object.keys(entries).length);
     }
-    MAX_CALLS = Number(cfg.max_calls) || Math.max(4, missing.length * 3);
+    collect(loadShard());
+    if (!prewarm && missing.length) {
+      var pendingID = [track, responseContext.body.length, source, cfg.target, cfg.model].join("|"), previous = readJSON(SNAPSHOT_ID, {});
+      // Repeated requests for one track must not rewrite a multi-MB snapshot every time.
+      if (previous.id !== pendingID || !(previous.expires > Date.now() + 600000)) {
+        var expires = Date.now() + 1800000;
+        var pendingTrack = JSON.stringify({body: responseContext.body, source: source, track: track, cfg: {target: cfg.target, model: cfg.model, concurrency: concurrency}, expires: expires});
+        if (YTSubs.utf8size(pendingTrack) > 16777216) { write(SNAPSHOT, undefined); write(SNAPSHOT_ID, undefined); log("pending_body_limit"); }
+        else if (!write(SNAPSHOT, pendingTrack)) log("pending_write_failed");
+        else write(SNAPSHOT_ID, JSON.stringify({id: pendingID, expires: expires}));
+        pendingTrack = null;
+      }
+    }
     if (!missing.length) return finish("CACHE_OR_NO_ELIGIBLE_CUES");
     var apiKey = String(read(KEY) || "").trim();
     if (!apiKey || /[\s\r\n]/.test(apiKey) || apiKey.indexOf("PASTE_") === 0) return finish("NO_LOCAL_KEY");
     if (Number(read(COOLDOWN)) > Date.now()) return finish("COOLDOWN");
-    var batches = [], current = [], chars = 0;
-    missing.forEach(function (c) {
-      if (current.length && (current.length >= 24 || chars + c.text.length > 2400)) { batches.push(current); current = []; chars = 0; }
-      current.push(c); chars += c.text.length;
-    });
-    if (current.length) batches.push(current);
     // Every batch remains eligible; time and concurrency, not price, bound execution.
-    var recovery = [];
+    var batches = [], recovery = [];
     var next = 0, active = 0, pending = 0, stopped = false, batchFailed = false;
     timer = setTimeout(function () { finish("DEADLINE"); }, Math.max(1, DEADLINE_MS - (Date.now() - started)));
+    function peerBusy() {
+      var value = String(read(LOCK + track) || "");
+      return value !== lockValue && Number(value.split(":")[0]) > Date.now();
+    }
+    function start() {
+      if (done) return;
+      if (!missing.length) return finish("COMPLETE");
+      lockValue = (started + DEADLINE_MS + 1000) + ":" + Math.random().toString(36).slice(2);
+      write(LOCK + track, lockValue);
+      if (peerBusy()) { lockValue = null; return waitForPeer(); } // Lost a simultaneous start.
+      MAX_CALLS = Number(cfg.max_calls) || Math.max(4, missing.length * 3);
+      var current = [], chars = 0;
+      missing.forEach(function (c) {
+        if (current.length && (current.length >= 24 || chars + c.text.length > 2400)) { batches.push(current); current = []; chars = 0; }
+        current.push(c); chars += c.text.length;
+      });
+      if (current.length) batches.push(current);
+      pump();
+    }
+    function waitForPeer() {
+      // YouTube re-requested a track another execution is still translating: reuse its
+      // checkpoints instead of doubling API calls and memory, then translate what is left.
+      var since = Date.now();
+      (function poll() {
+        if (done) return;
+        collect(loadShard()); waitedMS = Date.now() - since;
+        if (!missing.length) return finish("COMPLETE");
+        if (!peerBusy()) return start();
+        if (remaining() < WAIT_MS) return finish("PEER_PARTIAL");
+        setTimeout(poll, WAIT_MS);
+      })();
+    }
     function pump() {
       if (done) return;
       if (Number(read(COOLDOWN)) > Date.now()) stopped = true;
@@ -522,7 +622,8 @@ var YTSubsPrewarm = true;
               aliases[c.id].forEach(function (id) { translations[id] = result[c.id]; counts.translated++; });
               additions.push({k: c.key, v: result[c.id], expires: Date.now() + 7 * 86400000});
             });
-            if (prewarm && additions.length >= 96) saveCache();
+            // Checkpoints let a waiting duplicate request (or a later run) reuse progress early.
+            if (additions.length >= CHECKPOINT) saveCache();
           }
         } catch (e) {
           if (e && /^(ENVELOPE|COUNT_OR_SHAPE|ID_OR_TEXT|INVALID_JSON|EMPTY_CONTENT)$/.test(e.detail)) detail = e.detail;
@@ -566,6 +667,6 @@ var YTSubsPrewarm = true;
         }, callback);
       } catch (e) { callback(e, null, null); }
     }
-    pump();
+    if (peerBusy()) waitForPeer(); else start();
   } catch (e) { finish(e.code || "SCRIPT_ERROR"); }
 })();

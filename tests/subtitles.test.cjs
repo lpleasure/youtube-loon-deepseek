@@ -8,9 +8,14 @@ const C = require('../src/core.js');
 const root = path.resolve(__dirname, '..');
 const fixture = format => fs.readFileSync(path.join(__dirname, 'fixtures', `manual.${format}`), 'utf8');
 const plain = value => JSON.parse(JSON.stringify(value));
+const SHARD_KEY = 'ytloon.shard.v2.vsynthetic';
+const shardKeys = store => Object.keys(store).filter(k => k.startsWith('ytloon.shard.v2.'));
+const cacheText = store => { const keys = shardKeys(store); return keys.length ? keys.map(k => store[k]).join('\n') : undefined; };
+const cacheCount = store => shardKeys(store).reduce((n, k) => n + Object.keys(JSON.parse(store[k]).t).length, 0);
 const requestURL = 'https://www.youtube.com/api/timedtext?v=synthetic&lang=en&signature=PRIVATE_SENTINEL';
 function harness(mode = 'translate', options = {}) {
-  const store = Object.assign({'ytloon.deepseek.key': 'TEST_ONLY_NOT_A_REAL_CREDENTIAL'}, options.store);
+  // `shared` passes one live store object so two executions can run against it concurrently.
+  const store = options.shared || Object.assign({'ytloon.deepseek.key': 'TEST_ONLY_NOT_A_REAL_CREDENTIAL'}, options.store);
   const results = [], calls = [], logs = [], timers = new Map(); let serial = 0;
   let now = Date.now(); const epoch = now;
   function advance(ms) {
@@ -113,8 +118,8 @@ test('valid API result is merged; key and signed URL never appear in logs/cache/
   assert.equal(payload.response_format.type, 'json_object'); assert.equal(payload.thinking.type, 'disabled');
   assert.equal(payload.stream, false); assert.equal(opt.timeout, 12000);
   h.respond(); assert.equal(h.results.length, 1); assert.ok(h.results[0].body.includes('译文'));
-  assert.ok(h.store['ytloon.cache.v1']);
-  for (const text of [h.logs.join(' '), h.store['ytloon.cache.v1'], opt.body]) {
+  assert.ok(cacheText(h.store));
+  for (const text of [h.logs.join(' '), cacheText(h.store), opt.body]) {
     assert.equal(text.includes('TEST_ONLY_NOT_A_REAL_CREDENTIAL'), false); assert.equal(text.includes('PRIVATE_SENTINEL'), false);
   }
 });
@@ -125,13 +130,13 @@ test('cached replay requires zero HTTP requests even after key is removed', () =
 });
 test('expired cache, model, target and source changes each miss cache', () => {
   const a = harness(); a.respond();
-  const expired = JSON.parse(a.store['ytloon.cache.v1']).map(r => ({...r, expires: 1}));
-  assert.equal(harness('translate', {store: {...a.store, 'ytloon.cache.v1': JSON.stringify(expired)}}).calls.length, 1);
+  const expired = {...JSON.parse(a.store[SHARD_KEY]), e: 1};
+  assert.equal(harness('translate', {store: {...a.store, [SHARD_KEY]: JSON.stringify(expired)}}).calls.length, 1);
   for (const args of [{enabled:true, model:'different-model'}, {enabled:true, target:'ja'}]) assert.equal(harness('translate', {store:a.store, args}).calls.length, 1);
   assert.equal(harness('translate', {store:a.store, url:requestURL.replace('lang=en', 'lang=ja')}).calls.length, 1);
 });
 test('cache corruption recovers; storage failure still returns valid translated subtitles', () => {
-  const h = harness('translate', {store:{'ytloon.cache.v1':'broken'}, storageFails:true}); h.respond();
+  const h = harness('translate', {store:{[SHARD_KEY]:'broken','ytloon.index.v2':'broken'}, storageFails:true}); h.respond();
   assert.ok(h.results[0].body.includes('译文')); assert.ok(h.logs.some(x => x.includes('cache_write_failed')));
 });
 for (const status of [401,403,429,400,402,422,302]) test(`HTTP ${status} falls back without retry and starts classified cooldown`, () => {
@@ -157,12 +162,12 @@ for (const [name, transform] of [
 ]) test(`${name}: rejects whole batch, no bad cache`, () => {
   const h = harness(); h.respond(0, transform);
   for (let i=1; i<h.calls.length; i++) h.respond(i,transform);
-  assert.deepEqual(h.results,[{}]); assert.equal(h.store['ytloon.cache.v1'],undefined);
+  assert.deepEqual(h.results,[{}]); assert.equal(cacheText(h.store),undefined);
   assert.equal(h.store['ytloon.cooldown.v1'], undefined); assert.ok(h.calls.length <= 3);
   assert.equal(harness('translate', {store:h.store}).calls.length, 1);
 });
 test('global deadline ignores late and duplicate callbacks; done exactly once', () => {
-  const h = harness(); h.deadline(); h.respond(); h.respond(); assert.deepEqual(h.results,[{}]); assert.equal(h.store['ytloon.cache.v1'],undefined);
+  const h = harness(); h.deadline(); h.respond(); h.respond(); assert.deepEqual(h.results,[{}]); assert.equal(cacheText(h.store),undefined);
 });
 test('identical source cue is translated once then mapped to all IDs', () => {
   const body = JSON.stringify({events:[0,1].map(i=>({tStartMs:i*1000,dDurationMs:900,segs:[{utf8:'same'}]}))});
@@ -188,14 +193,74 @@ test('header adjustment removes stale metadata and preserves Content-Type', () =
   assert.deepEqual(C.headers({'content-length':'1','CONTENT-ENCODING':'gzip',ETag:'x','Content-Type':'text/vtt','Cache-Control':'public',Server:'test'}),{'Content-Type':'text/vtt',Server:'test','Cache-Control':'no-store'});
 });
 test('UTF8 cache size counts Chinese and emoji correctly', () => { assert.equal(C.utf8size('a中😀'),Buffer.byteLength('a中😀')); });
-test('cache capacity is bounded by both bytes and record count', () => {
-  const records = Array.from({length:500},(_,i)=>({k:'old'+i,v:'中'.repeat(800),expires:Date.now()+100000}));
-  const h = harness('translate',{store:{'ytloon.cache.v1':JSON.stringify(records)}}); h.respond();
-  const saved=h.store['ytloon.cache.v1']; assert.ok(Buffer.byteLength(saved)<=4194304); assert.ok(JSON.parse(saved).length<=6000);
+test('cache shards are evicted oldest first by total bytes and shard count; current track stays', () => {
+  const now = Date.now(), store = {}, index = {m:1, s:{}};
+  for (let i = 0; i < 8; i++) { index.s['old'+i] = [now+100000+i, 1048576]; store['ytloon.shard.v2.old'+i] = 'x'; }
+  store['ytloon.index.v2'] = JSON.stringify(index);
+  const h = harness('translate',{store}); h.respond();
+  const saved = JSON.parse(h.store['ytloon.index.v2']), ids = Object.keys(saved.s);
+  assert.ok(ids.includes('vsynthetic')); assert.ok(ids.reduce((n,id)=>n+saved.s[id][1],0) <= 6291456);
+  assert.equal(h.store['ytloon.shard.v2.old0'], undefined); assert.equal(h.store['ytloon.shard.v2.old7'], 'x');
+  for (const id of Object.keys(index.s)) assert.equal(ids.includes(id), h.store['ytloon.shard.v2.'+id] === 'x');
+  const many = {m:1, s:{}}; for (let i = 0; i < 450; i++) many.s['t'+i] = [now+100000+i, 10];
+  const b = harness('translate',{store:{'ytloon.index.v2':JSON.stringify(many)}}); b.respond();
+  assert.equal(Object.keys(JSON.parse(b.store['ytloon.index.v2']).s).length, 400);
+});
+test('expired shards are removed from storage when the index is updated', () => {
+  const store = {'ytloon.index.v2':JSON.stringify({m:1,s:{gone:[1,100]}}), 'ytloon.shard.v2.gone':'x'};
+  const h = harness('translate',{store}); h.respond();
+  assert.equal(h.store['ytloon.shard.v2.gone'], undefined); assert.equal(JSON.parse(h.store['ytloon.index.v2']).s.gone, undefined);
 });
 test('cache merges fresh concurrent entries at completion', () => {
-  const h=harness(); h.store['ytloon.cache.v1']=JSON.stringify([{k:'parallel',v:'其他',expires:Date.now()+10000}]);
-  h.respond(); assert.ok(JSON.parse(h.store['ytloon.cache.v1']).some(r=>r.k==='parallel'));
+  const h=harness(); h.store[SHARD_KEY]=JSON.stringify({e:Date.now()+10000,t:{parallel:'其他'}});
+  h.respond(); assert.equal(JSON.parse(h.store[SHARD_KEY]).t.parallel,'其他');
+});
+test('legacy single-key cache is deleted without being read; key and settings remain', () => {
+  let touched = false; const store = {'ytloon.deepseek.key':'TEST_ONLY_NOT_A_REAL_CREDENTIAL','ytloon.settings.v1':'{}'};
+  Object.defineProperty(store, 'ytloon.cache.v1', {get(){ touched = true; return '[]'; }, enumerable:true, configurable:true});
+  const h = harness('translate',{shared:store}); h.respond();
+  assert.equal(touched, false); assert.equal(Object.prototype.hasOwnProperty.call(h.store,'ytloon.cache.v1'), false);
+  assert.ok(h.store['ytloon.deepseek.key']); assert.ok(h.store['ytloon.settings.v1']); assert.equal(JSON.parse(h.store['ytloon.index.v2']).m, 1);
+});
+test('each video gets its own shard and never reads another video shard', () => {
+  const a = harness(); a.respond();
+  const reads = [], store = new Proxy({...a.store}, {get(t,k){ if (typeof k==='string') reads.push(k); return t[k]; }});
+  const b = harness('translate',{shared:store, url:requestURL.replace('v=synthetic','v=otherVideo1')});
+  assert.equal(b.calls.length,1); assert.equal(reads.includes(SHARD_KEY), false);
+  b.respond(); assert.ok(store['ytloon.shard.v2.votherVideo1']); assert.ok(store[SHARD_KEY]);
+  const noID = harness('translate',{url:requestURL.replace('v=synthetic&','')}); noID.respond();
+  assert.ok(Object.keys(noID.store).some(k=>/^ytloon\.shard\.v2\.h[0-9a-z]+$/.test(k)));
+});
+test('duplicate request for a track in progress waits for the peer instead of translating again', () => {
+  const a = harness(); assert.equal(a.calls.length,1);
+  const b = harness('translate',{shared:a.store}); assert.equal(b.calls.length,0);
+  a.respond(); b.advance(1000);
+  assert.equal(b.calls.length,0); assert.ok(b.results[0].body.includes('译文'));
+  assert.ok(b.logs.some(s=>s.includes('result=COMPLETE')&&/waited_ms=[1-9]/.test(s)));
+  assert.equal(a.store['ytloon.lock.v2.vsynthetic'], undefined);
+});
+test('waiting request translates the remainder when the peer stops early, and ignores stale locks', () => {
+  const store = {'ytloon.deepseek.key':'TEST_ONLY_NOT_A_REAL_CREDENTIAL','ytloon.lock.v2.vsynthetic':String(Date.now()+3000)+':peer'};
+  const b = harness('translate',{shared:store}); assert.equal(b.calls.length,0);
+  b.advance(3000); assert.equal(b.calls.length,1); b.respond(); assert.ok(b.results[0].body.includes('译文'));
+  const stale = harness('translate',{store:{'ytloon.lock.v2.vsynthetic':'1:dead'}}); assert.equal(stale.calls.length,1);
+});
+test('waiting request returns peer checkpoints at its own deadline', () => {
+  const a = harness('translate',{body:manyCues(200),args:{enabled:true}});
+  const b = harness('translate',{shared:a.store,body:manyCues(200),args:{enabled:true}}); assert.equal(b.calls.length,0);
+  for (let i=0;i<4;i++) a.respond(i);
+  b.advance(22000); const events = JSON.parse(b.results[0].body).events;
+  assert.equal(events.filter(e=>e.segs[0].utf8.includes('译文')).length,96); assert.equal(b.calls.length,0);
+  assert.ok(b.logs.some(s=>s.includes('result=PEER_PARTIAL')||s.includes('result=DEADLINE')));
+});
+test('repeated identical request does not rewrite the pending snapshot', () => {
+  const h = harness('translate',{body:manyCues(30),noClearTimeout:true}); h.deadline();
+  const marked = {...JSON.parse(h.store['ytloon.pending.v1']), marker:1};
+  h.store['ytloon.pending.v1'] = JSON.stringify(marked);
+  const again = harness('translate',{body:manyCues(30),store:h.store}); again.deadline();
+  assert.equal(JSON.parse(again.store['ytloon.pending.v1']).marker, 1);
+  const other = harness('translate',{body:manyCues(31),store:h.store}); other.deadline();
+  assert.equal(JSON.parse(other.store['ytloon.pending.v1']).marker, undefined);
 });
 test('API reordered IDs map to correct cues', () => {
   const h=harness(); h.respond(0,(x)=>{const content=JSON.parse(x.choices[0].message.content); content.translations.reverse(); x.choices[0].message.content=JSON.stringify(content); return x;});
@@ -287,7 +352,7 @@ for (const status of [500,502,503,504]) test('HTTP '+status+' retries once after
   httpFailure(h,0,status); assert.equal(h.results.length,0); assert.equal(h.store['ytloon.cooldown.v1'],undefined);
   h.advance(749); assert.equal(h.calls.length,1);
   h.advance(1); assert.equal(h.calls.length,2); assert.equal(h.calls[0].options.body,h.calls[1].options.body);
-  h.respond(1); assert.ok(h.results[0].body.includes('译文')); assert.ok(h.store['ytloon.cache.v1']);
+  h.respond(1); assert.ok(h.results[0].body.includes('译文')); assert.ok(cacheText(h.store));
   assert.ok(h.logs.some(x=>x.includes('api_error=HTTP_SERVER status='+status) && x.includes('retry_in_ms=750')));
   assert.equal(h.store['ytloon.cooldown.v1'],undefined);
 });
@@ -400,7 +465,7 @@ for (const [code, transform] of [
   for (let i=1; i<h.calls.length; i++) h.respond(i,transform);
   assert.ok(h.logs.some(x=>x.includes('api_error='+code+' status=200')));
   assert.equal(h.logs.join(' ').includes('PRIVATE_SENTINEL'),false);
-  assert.equal(h.store['ytloon.cache.v1'],undefined); assert.equal(h.store['ytloon.cooldown.v1'],undefined);
+  assert.equal(cacheText(h.store),undefined); assert.equal(h.store['ytloon.cooldown.v1'],undefined);
   assert.deepEqual(h.results,[{}]); assert.ok(h.calls.length<=3);
 });
 
@@ -430,14 +495,14 @@ test('missing HTTP callback returns partial success at 22s, ignores late/duplica
   const h=harness('translate',{body:manyCues(30),noClearTimeout:true});
   h.respond(0); h.advance(21999); assert.equal(h.results.length,0);
   h.advance(1); assert.ok(h.results[0].body.includes('译文'));
-  const saved=h.store['ytloon.cache.v1']; h.respond(1); h.respond(0);
-  assert.equal(h.store['ytloon.cache.v1'],saved); assert.equal(h.results.length,1);
+  const saved=cacheText(h.store); h.respond(1); h.respond(0);
+  assert.equal(cacheText(h.store),saved); assert.equal(h.results.length,1);
   assert.ok(h.logs.some(x=>x.includes('result=DEADLINE')));
 });
 
 test('callback after absolute deadline is ignored even before timer has fired', () => {
   const h=harness(); h.elapse(22000); h.respond();
-  assert.deepEqual(h.results,[{}]); assert.equal(h.store['ytloon.cache.v1'],undefined);
+  assert.deepEqual(h.results,[{}]); assert.equal(cacheText(h.store),undefined);
 });
 
 test('success in the final processing margin is preserved before the absolute deadline', () => {
@@ -471,16 +536,16 @@ for (const [code,change] of [
   h.respond(0,change); assert.equal(h.calls.length,3);
   assert.equal(inputOf(h.calls[1]).length,12); assert.equal(inputOf(h.calls[2]).length,12);
   assert.deepEqual(inputOf(h.calls[1]).concat(inputOf(h.calls[2])),inputOf(h.calls[0]));
-  assert.equal(h.store['ytloon.cache.v1'],undefined);
+  assert.equal(cacheText(h.store),undefined);
   h.respond(1); h.respond(2);
-  assert.equal(JSON.parse(h.store['ytloon.cache.v1']).length,24);
+  assert.equal(cacheCount(h.store),24);
   assert.ok(h.logs.some(s=>s.includes('action=split')&&s.includes('cues=24')));
   assert.equal(h.results.length,1);
 });
 test('failed child cannot split again; valid sibling survives',()=>{
   const h=harness(); h.respond(0,innerFailure); h.respond(1,innerFailure); h.respond(2);
   assert.equal(h.calls.length,3); assert.equal(h.results.length,1);
-  assert.equal(JSON.parse(h.store['ytloon.cache.v1']).length,1);
+  assert.equal(cacheCount(h.store),1);
   assert.deepEqual(JSON.parse(h.results[0].body).events[1].segs,JSON.parse(fixture('json3')).events[1].segs);
 });
 test('single cue retries validation once after backoff',()=>{
@@ -539,20 +604,20 @@ test('default full-track mode translates 2400 cues with fast replies, including 
   for(let i=0;i<h.calls.length;i++) h.respond(i);
   assert.equal(h.calls.length,100); assert.equal(h.results.length,1);
   assert.ok(JSON.parse(h.results[0].body).events[2399].segs[0].utf8.includes('译文'));
-  assert.equal(JSON.parse(h.store['ytloon.cache.v1']).length,2400);
+  assert.equal(cacheCount(h.store),2400);
   assert.ok(h.logs.some(s=>s.includes('result=COMPLETE ')));
 });
 test('slow long track resumes in manual prewarm and subsequent response is fully cached',()=>{
   const body=manyCues(2400), h=harness('translate',{body,args:{enabled:true}});
   assert.equal(completeWaves(h),8);
   assert.ok(h.logs.some(s=>s.includes('result=DEADLINE')));
-  assert.ok(JSON.parse(h.store['ytloon.cache.v1']).length<2400);
+  assert.ok(cacheCount(h.store)<2400);
   const snapshot=h.store['ytloon.pending.v1'];
   assert.equal(snapshot.includes('PRIVATE_SENTINEL'),false);
   assert.equal(snapshot.includes('TEST_ONLY_NOT_A_REAL_CREDENTIAL'),false);
   const worker=harness('prewarm',{store:h.store});
   assert.equal(completeWaves(worker),8); assert.deepEqual(worker.results,[{}]);
-  assert.equal(JSON.parse(worker.store['ytloon.cache.v1']).length,2400);
+  assert.equal(cacheCount(worker.store),2400);
   const replay=harness('translate',{body,store:worker.store,args:{enabled:true}});
   assert.equal(replay.calls.length,0);
   assert.equal(JSON.parse(replay.results[0].body).events.filter(e=>e.segs[0].utf8.includes('译文')).length,2400);
@@ -563,7 +628,7 @@ test('prewarm missing/expired job never calls API; checkpoint survives unfinishe
   const h=harness('translate',{body:manyCues(600),args:{enabled:true}}); h.deadline();
   const w=harness('prewarm',{store:h.store});
   for(let i=0;i<4;i++) w.respond(i);
-  assert.equal(JSON.parse(w.store['ytloon.cache.v1']).length,96);
+  assert.equal(cacheCount(w.store),96);
   w.advance(270000); assert.equal(w.results.length,1);
   const resumed=harness('prewarm',{store:w.store});
   assert.equal(inputOf(resumed.calls[0])[0].id,96);
@@ -585,7 +650,7 @@ test('four-hour 14400-cue track survives prewarm and fully cached replay',()=>{
  const body=manyCues(14400), capture=harness('translate',{body,args:{enabled:true}}); capture.deadline();
  const worker=harness('prewarm',{store:capture.store});
  for(let i=0;i<worker.calls.length;i++) worker.respond(i);
- assert.equal(JSON.parse(worker.store['ytloon.cache.v1']).length,14400);
+ assert.equal(cacheCount(worker.store),14400);
  const replay=harness('translate',{body,store:worker.store,args:{enabled:true}});
  assert.equal(replay.calls.length,0);
  assert.equal(JSON.parse(replay.results[0].body).events.filter(e=>e.segs[0].utf8.includes('译文')).length,14400);
@@ -593,15 +658,15 @@ test('four-hour 14400-cue track survives prewarm and fully cached replay',()=>{
 test('prewarm recovers missing callback and ignores late original success',()=>{
  const h=harness('translate',{body:manyCues(48),args:{enabled:true}});h.deadline();
  const w=harness('prewarm',{store:h.store}); w.respond(1); w.advance(30750);
- assert.equal(w.calls.length,3);w.respond(2);const saved=w.store['ytloon.cache.v1'];w.respond(0);
- assert.equal(w.store['ytloon.cache.v1'],saved);assert.equal(w.results.length,1);
- assert.equal(JSON.parse(saved).length,48);
+ assert.equal(w.calls.length,3);w.respond(2);const saved=cacheText(w.store);w.respond(0);
+ assert.equal(cacheText(w.store),saved);assert.equal(w.results.length,1);
+ assert.equal(cacheCount(w.store),48);
 });
 test('prewarm repeated transient failure does not abandon later batches',()=>{
  const h=harness('translate',{body:manyCues(240),args:{enabled:true,concurrency:1}});h.deadline();
  const w=harness('prewarm',{store:h.store});httpFailure(w,0,503);w.advance(750);httpFailure(w,1,503);
  for(let i=2;i<w.calls.length;i++) w.respond(i);
- assert.equal(w.results.length,1);assert.equal(JSON.parse(w.store['ytloon.cache.v1']).length,216);
+ assert.equal(w.results.length,1);assert.equal(cacheCount(w.store),216);
 });
 test('release ignores old start offsets',()=>{const h=harness('translate',{body:manyCues(2),args:{enabled:true,start_seconds:100}});assert.equal(inputOf(h.calls[0])[0].id,0);h.respond();assert.equal(h.results.length,1);});
 
@@ -659,10 +724,10 @@ test('SRV3 plain cues can split multiple sentences and preserve XML entities',()
  const parsed=C.parse(d.render({0:'一与二。',1:'三小于四。',2:'五和六。'}));assert.equal(parsed.cues.length,3);assert.ok(parsed.cues[1].text.includes('Three < four.'));
 });
 test('SRV3 new sentence cache namespace bypasses old translations without clearing key',()=>{
- const body=srvSentences(),d=C.sentenceParse(body),old=d.cues.map(c=>({k:JSON.stringify(['prompt-v1','deepseek-flash','zh-Hans','en',c.text]),v:'OLD_TRANSLATION',expires:Date.now()+86400000}));
- const h=harness('translate',{body,store:{'ytloon.cache.v1':JSON.stringify(old)}});assert.ok(h.calls.length);h.respond();
+ const body=srvSentences(),d=C.sentenceParse(body),old={e:Date.now()+86400000,t:Object.fromEntries(d.cues.map(c=>[C.hash(JSON.stringify(['prompt-v1','deepseek-flash','zh-Hans','en',c.text])),'OLD_TRANSLATION']))};
+ const h=harness('translate',{body,store:{[SHARD_KEY]:JSON.stringify(old)}});assert.ok(h.calls.length);h.respond();
  assert.ok(h.logs.some(s=>s.includes('sentence=srv3_estimated')));assert.equal(h.results[0].body.includes('OLD_TRANSLATION'),false);
- assert.ok(h.store['ytloon.deepseek.key']);assert.ok(JSON.parse(h.store['ytloon.cache.v1']).some(r=>r.v==='OLD_TRANSLATION'));
+ assert.ok(h.store['ytloon.deepseek.key']);assert.ok(Object.values(JSON.parse(h.store[SHARD_KEY]).t).includes('OLD_TRANSLATION'));
  const replay=harness('translate',{body,store:h.store});assert.equal(replay.calls.length,0);assert.ok(replay.results[0].body.includes('译文'));
 });
 function longSentence() {
