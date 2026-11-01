@@ -24,6 +24,40 @@ var YTSubs = (function () {
   function bilingual(source, translated) { return clean(translated) + "\n" + source.replace(/\s+/g, " "); }
   // CJK glyphs take about two Latin columns on screen.
   function width(s) { return s.replace(/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g, "xx").length; }
+  // Widest source line per cue: translation above plus source must fit a phone-sized player.
+  var MAX_CUE = 90;
+  var CLAUSE_START = /^(?:and|but|or|so|because|which|while|when|whereas|although|though|since|unless|until|where|who|if|then)$/;
+  var PHRASE_START = /^(?:to|of|in|on|at|for|with|from|by|about|into|after|before|the|a|an|that)$/;
+  // Words that lead into what follows; a cue ending on one reads like "... I" / "love you".
+  var LEADS_ON = /^(?:i|a|an|the|to|of|my|your|his|her|our|their|its|this|these|those|and|or|but|so|if|because|that|which|who|in|on|at|for|with|from|by|as|than|is|are|was|were|be|been|not|no|very|really|just|i'm|i've|i'll|i'd|you're|we're|they're|it's|there's|let's|gonna|wanna|can|could|will|would|should|must|do|does|did|have|has|had)$/;
+  function bare(t) { return t.text.trim().toLowerCase().replace(/’/g, "'").replace(/^["'“‘(]+|[.,;:!?"'”’)]+$/g, ""); }
+  function breakCost(last, next) {
+    if (/[,;:]["'’”)]*\s*$/.test(last.text)) return 0;
+    var cost = /[-–—]\s*$/.test(last.text) ? 1 : CLAUSE_START.test(bare(next)) ? 2 : PHRASE_START.test(bare(next)) ? 4 : 7;
+    return cost + (LEADS_ON.test(bare(last)) ? 20 : 0);
+  }
+  // Splits one sentence only when it is wider than MAX_CUE: picks the break set (dynamic
+  // programming over word boundaries) that keeps pieces near equal width, prefers punctuation
+  // and clause/phrase starts, and avoids ending a piece on a word that leads on.
+  function splitSentence(list) {
+    var sums = [0];
+    list.forEach(function (t, i) { sums.push(sums[i] + width(t.text.trim()) + (i ? 1 : 0)); });
+    var n = list.length, total = sums[n];
+    if (total <= MAX_CUE || n < 2) return [list];
+    var ideal = total / Math.ceil(total / MAX_CUE), best = [0], from = [];
+    for (var j = 1; j <= n; j++) {
+      best[j] = Infinity;
+      for (var i = j - 1; i >= 0; i--) {
+        var w = sums[j] - sums[i] - (i ? 1 : 0);
+        if (w > MAX_CUE && j - i > 1) break;
+        var cost = best[i] + 8 + Math.pow((w - ideal) / 8, 2) + (j < n ? breakCost(list[j - 1], list[j]) : 0);
+        if (cost < best[j]) { best[j] = cost; from[j] = i; }
+      }
+    }
+    var pieces = [];
+    for (var k = n; k > 0; k = from[k]) pieces.unshift(list.slice(from[k], k));
+    return pieces;
+  }
   function primaryLanguage(code) { return String(code || "").toLowerCase().split(/[-_]/)[0]; }
   // zh-Hans/zh-Hant/zh-TW/zh all share "zh". For a Chinese target, a mostly-Han track
   // without kana is Chinese whatever its (possibly missing) language code says.
@@ -155,22 +189,29 @@ var YTSubs = (function () {
     }); });
     // Repeated/overlapping word timestamps need a track-specific deduplicator.
     if (tokens.some(function (t, i) { return i && t.start <= tokens[i - 1].start; })) return original;
-    var rebuilt = [], current = null;
-    function flush(end) {
-      if (!current) return;
-      rebuilt.push({tStartMs: current.start, dDurationMs: Math.max(1, end - current.start), segs: [{utf8: current.text.trim()}]}); current = null;
+    var rebuilt = [], sentence = [], sentenceWidth = 0;
+    function join(list) {
+      return list.reduce(function (text, t) { return text + (text && !/\s$/.test(text) && !/^\s|^[,.;:!?]/.test(t.text) ? " " : "") + t.text; }, "").trim();
     }
-    // Translation sits above the source, so a whole long sentence covers a phone-sized
-    // player. Past MIN_CUE prefer clause breaks; MAX_CUE/MAX_CUE_MS are hard limits.
-    var MIN_CUE = 45, MAX_CUE = 90, MAX_CUE_MS = 8000;
-    var CLAUSE_START = /^\s*(?:and|but|or|so|because|which|while|when|whereas|although|though|since|unless|if)\b/i;
+    function emit(end) {
+      if (!sentence.length) return;
+      var pieces = splitSentence(sentence);
+      pieces.forEach(function (piece, k) {
+        var next = pieces[k + 1];
+        rebuilt.push({tStartMs: piece[0].start, dDurationMs: Math.max(1, (next ? next[0].start : end) - piece[0].start), segs: [{utf8: join(piece)}]});
+      });
+      sentence = []; sentenceWidth = 0;
+    }
+    // Whole sentences are collected first (end punctuation, a 1.5s pause, or a long safety
+    // bound for unpunctuated captions); only those wider than MAX_CUE are then split, so the
+    // translation plus source never covers a phone-sized player.
+    var MAX_SENTENCE = 600, MAX_SENTENCE_MS = 45000;
     tokens.forEach(function (t, i) {
-      var previous = tokens[i - 1], size = current ? width(current.text) : 0;
-      if (current && (t.start - current.start >= MAX_CUE_MS || size + width(t.text) > MAX_CUE || previous.end + 1500 < t.start || (size >= MIN_CUE && CLAUSE_START.test(t.text)))) flush(Math.min(previous.end, t.start));
-      if (!current) current = {start: t.start, text: ""};
-      current.text += (current.text && !/\s$/.test(current.text) && !/^\s|^[,.;:!?]/.test(t.text) ? " " : "") + t.text;
+      var previous = tokens[i - 1];
+      if (sentence.length && (t.start - sentence[0].start >= MAX_SENTENCE_MS || sentenceWidth + width(t.text) > MAX_SENTENCE || previous.end + 1500 < t.start)) emit(Math.min(previous.end, t.start));
+      sentence.push(t); sentenceWidth += width(t.text) + 1;
       var next = tokens[i + 1];
-      if (/[.!?]["'’”)]*\s*$/.test(t.text) || (width(current.text) >= MIN_CUE && /[,;:]["'’”)]*\s*$/.test(t.text)) || !next) flush(next ? Math.min(t.end, next.start) : t.end);
+      if (/[.!?]["'’”)]*\s*$/.test(t.text) || !next) emit(next ? Math.min(t.end, next.start) : t.end);
     });
     var normalized = {events: rebuilt};
     var result = parse(JSON.stringify(normalized));
