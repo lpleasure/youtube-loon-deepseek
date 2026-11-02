@@ -30,4 +30,19 @@
 
 整句同步：对支持的单窗口 JSON3、SRV3 轨道重组语句；SRV3 缺少逐词时间时估算句内时间，再生成同时切换的中英文字幕。详见 [同步处理说明](ALIGNMENT.md)。
 
-自动回归测试使用模拟 API，保留在 tests/，不进入插件。运行 node tools/build.cjs 和 node --test tests/*.test.cjs。
+## 仓库结构
+
+```
+plugins/        在线安装用的插件（脚本地址指向本仓库），由构建生成
+dist/           完整本地版：两个插件 + 两个打包好的脚本，由构建生成，不要手改
+src/            脚本源码：core.js（字幕解析与输出）、translate.js（翻译与缓存）
+tools/          build.cjs 构建；subscription.cjs 生成 plugins/；inspect-har.cjs 离线分析抓包
+tests/          自动测试（模拟 API，不进入插件），fixtures/ 为人工构造的字幕样本
+subscription.json       plugins/ 里脚本网址使用的仓库和分支
+clear-cache.js          在 Loon 手动运行：清缓存，保留 Key
+remove-local-data.js    在 Loon 手动运行：删除 Key、缓存和设置
+local-setup.example.js  旧的本地存 Key 方式，可改用插件设置
+ALIGNMENT.md            字幕整句同步的实现说明
+```
+
+修改流程：改 src/ → node tools/build.cjs → node --test tests/*.test.cjs
