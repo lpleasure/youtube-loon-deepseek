@@ -103,7 +103,7 @@
       if (!prewarm && doc && Object.keys(translations).length) response = {body: doc.render(translations), headers: YTSubs.headers(responseContext.headers)};
     } catch (_) { response = {}; reason = "OUTPUT_ERROR"; }
     if (lockValue && read(LOCK + track) === lockValue) write(LOCK + track, undefined);
-    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + (native ? " native=" + native : "") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.3.0 elapsed_ms=" + (Date.now() - started));
+    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + (native ? " native=" + native : "") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.3.1 elapsed_ms=" + (Date.now() - started));
     $done(response);
   }
   function header(headers, name) {

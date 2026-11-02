@@ -919,6 +919,15 @@ test('timeouts never mark a video as lacking a native track; native always wins 
  assert.equal(native.calls.length,0);assert.ok(native.logs.some(s=>s.includes('result=NATIVE')));
  assert.ok(nativeTexts(native)[0].startsWith('大多数人自己选'));
 });
+test('a native cue merging two source lines is shown on both, not only the later one',()=>{
+ const english=JSON.stringify({events:[ev(10000,2000,'until you have an entire neighborhood.'),ev(12000,2500,"But what's a city without a school?"),ev(14600,1900,'So of course, we have to build that, too.'),ev(16500,2500,'One hundred THOUSAND pounds of concrete later,'),ev(19000,1000,'WOOO!')]});
+ const chinese=JSON.stringify({events:[ev(10200,4200,'直到建成一个完整的社区 但没有学校怎么能叫社区呢?'),ev(14700,4200,'所以我们当然也要建一所学校 浇筑了45吨混凝土后')]});
+ const h=harness('translate',{body:english,native:{'zh-Hans':chinese}});
+ assert.deepEqual(nativeTexts(h).map(t=>t.split('\n')[0]),['直到建成一个完整的社区 但没有学校怎么能叫社区呢?','直到建成一个完整的社区 但没有学校怎么能叫社区呢?','所以我们当然也要建一所学校 浇筑了45吨混凝土后','所以我们当然也要建一所学校 浇筑了45吨混凝土后','WOOO!']);
+ // One source line covering several native cues still lists them once each, in time order.
+ const one=C.alignNative(C.parse(JSON.stringify({events:[ev(0,6000,'A long single line.')]})).cues,C.parse(JSON.stringify({events:[ev(3000,3000,'后半'),ev(0,3000,'前半')]})).cues);
+ assert.equal(one[0],'前半 后半');
+});
 test('native URL swaps only the language and drops auto-caption and machine-translation markers',()=>{
  const url='https://www.youtube.com/api/timedtext?v=x&caps=asr&kind=asr&lang=en&tlang=fr&fmt=srv3&pot=P&signature=S';
  assert.equal(C.nativeURL(url,'zh-Hans'),'https://www.youtube.com/api/timedtext?v=x&caps=asr&lang=zh-Hans&fmt=srv3&pot=P&signature=S');

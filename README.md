@@ -1,4 +1,4 @@
-# YouTube DeepSeek 1.3.0
+# YouTube DeepSeek 1.3.1
 
 用 DeepSeek 把 YouTube 字幕翻译成中文，中文在上、原文在下。需要 Loon 3.5.1(983)+ 和你自己的 DeepSeek API Key。
 
