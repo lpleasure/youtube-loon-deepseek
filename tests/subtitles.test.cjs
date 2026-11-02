@@ -16,7 +16,7 @@ const requestURL = 'https://www.youtube.com/api/timedtext?v=synthetic&lang=en&si
 function harness(mode = 'translate', options = {}) {
   // `shared` passes one live store object so two executions can run against it concurrently.
   const store = options.shared || Object.assign({'ytloon.deepseek.key': 'TEST_ONLY_NOT_A_REAL_CREDENTIAL'}, options.store);
-  const results = [], calls = [], logs = [], timers = new Map(); let serial = 0;
+  const results = [], calls = [], gets = [], logs = [], timers = new Map(); let serial = 0;
   let now = Date.now(); const epoch = now;
   function advance(ms) {
     const target = now + ms;
@@ -29,18 +29,20 @@ function harness(mode = 'translate', options = {}) {
   }
   const ctx = {
     Date: class extends Date { static now() { return now; } },
-    $request: {url: options.url || requestURL},
+    $request: {url: options.url || requestURL, headers: options.requestHeaders || {'User-Agent': 'TEST_UA'}},
     $response: {status: options.status || 200, headers: {'Content-Type': 'application/json', 'Content-Length': '9', 'Content-Encoding': 'gzip', ETag: 'stale'}, body: options.body === undefined ? fixture('json3') : options.body},
     $argument: options.args === undefined ? {enabled: true, max_calls: 4, concurrency: 2} : options.args,
     $done: r => results.push(plain(r)),
     $persistentStore: {read: k => store[k], write: (v, k) => { if (options.storageFails) return false; if (v == null) delete store[k]; else store[k] = v; return true; }},
-    $httpClient: {post: (opt, cb) => { calls.push({options: plain(opt), cb}); if (options.throwHTTP) throw new Error('network PRIVATE_SENTINEL'); }},
+    $httpClient: {post: (opt, cb) => { calls.push({options: plain(opt), cb}); if (options.throwHTTP) throw new Error('network PRIVATE_SENTINEL'); },
+      // Native-track probes answer at once with an empty track unless a test supplies bodies or holds them.
+      get: (opt, cb) => { gets.push({options: plain(opt), cb}); if (!options.holdNative) cb(null, {status: 200}, (options.native || {})[new URL(opt.url).searchParams.get('lang')] || ''); }},
     console: {log: message => logs.push(message)},
     setTimeout: (fn, delay) => { timers.set(++serial, {fn, at: now + delay}); return serial; }, clearTimeout: id => timers.delete(id)
   };
   if (options.noClearTimeout) delete ctx.clearTimeout;
   vm.runInNewContext(fs.readFileSync(path.join(root, 'dist', `yt-${mode}.js`), 'utf8'), ctx, {timeout: 1000});
-  return {store, results, calls, logs, timers, epoch, advance, elapse(ms) { now += ms; }, now: () => now, respond(index = 0, customize) {
+  return {store, results, calls, gets, logs, timers, epoch, advance, elapse(ms) { now += ms; }, now: () => now, respond(index = 0, customize) {
     const call = calls[index], input = JSON.parse(JSON.parse(call.options.body).messages[1].content).subtitles;
     let outer = {choices: [{finish_reason: 'stop', message: {content: JSON.stringify({translations: input.map(c => ({id: c.id, text: '译文 ' + c.id}))})}}]};
     if (customize) outer = customize(outer, input);
@@ -810,6 +812,119 @@ test('long sentences split evenly at natural breaks and never end a cue on a lea
 test('split pieces share the sentence interval back to back',()=>{
  const cues=JSON.parse(C.sentenceParse(wordTrack('I think the most important thing about this phone is that it finally fixes the battery problem that everyone has been complaining about for years.')).render({0:'甲',1:'乙'})).events;
  assert.equal(cues[0].tStartMs+cues[0].dDurationMs,cues[1].tStartMs);
+});
+function asrSrv3() {
+ // Auto-caption layout: a line's first <s> has no t, and line durations overlap the next lines.
+ return '<?xml version="1.0" encoding="utf-8" ?><timedtext format="3"><head><ws id="0"/><ws id="1" mh="2" ju="0" sd="3"/><wp id="0"/><wp id="1" ap="6" ah="20" av="100" rc="2" cc="40"/></head><body><w t="0" id="1" wp="1" ws="1"/>'
+  + '<p t="18800" d="7160" w="1"><s ac="0">Most</s><s t="239" ac="0"> people</s><s t="559" ac="0"> pick</s><s t="1040" ac="0"> their</s></p>'
+  + '<p t="21800" d="7319" w="1"><s ac="0">starter.</s><s t="1000" ac="0"> Others</s><s t="1239" ac="0"> get</s><s t="1479" ac="0"> one</s><s t="1800" ac="0"> from</s><s t="2520" ac="0"> a</s><s t="2840" ac="0"> professor</s><s t="3399" ac="0"> who</s></p>'
+  + '<p t="25960" d="4319" w="1"><s ac="0">lives</s><s t="1079" ac="0"> in</s><s t="1319" ac="0"> town.</s><s t="1720" ac="0"> So</s><s t="2440" ac="0"> how</s><s t="2680" ac="0"> does</s></p>'
+  + '<p t="29119" d="5241" w="1"><s ac="0">that</s><s t="300" ac="0"> work?</s></p></body></timedtext>';
+}
+test('auto captions rebuild whole sentences across rolling lines using real word times',()=>{
+ const d=C.sentenceParse(asrSrv3());assert.equal(d.sentenceMode,'srv3_wordtimed');
+ assert.deepEqual(d.cues.map(c=>[c.startSeconds,c.text]),[[18.8,'Most people pick their starter.'],[22.8,'Others get one from a professor who lives in town.'],[27.68,'So how does that work?']]);
+ const out=C.parse(d.render({0:'大多数人会自己选初始宝可梦。',1:'其他人从镇上的博士那里得到一只。',2:'那是怎么回事？'}));
+ assert.deepEqual(out.cues.map(c=>c.text.split('\n')[1]),d.cues.map(c=>c.text));
+ const h=harness('translate',{body:asrSrv3()});h.respond();assert.ok(h.logs.some(s=>s.includes('sentence=srv3_wordtimed')));
+});
+test('auto caption word times past the next line start are estimated inside the line, not dropped',()=>{
+ const body=asrSrv3().replace('<s t="2680" ac="0"> does</s>','<s t="3500" ac="0"> does</s>');
+ const d=C.sentenceParse(body);assert.equal(d.sentenceMode,'srv3_estimated');
+ assert.equal(d.cues.map(c=>c.text).join(' '),'Most people pick their starter. Others get one from a professor who lives in town. So how does that work?');
+ for(let i=1;i<d.cues.length;i++) assert.ok(d.cues[i].startSeconds>d.cues[i-1].startSeconds);
+});
+const ev=(t,d,text)=>({tStartMs:t,dDurationMs:d,segs:[{utf8:text}]});
+const nativeEnglish=()=>JSON.stringify({events:[ev(0,3000,'Most people pick their starter.'),ev(3000,3000,'Others get one from a professor.'),ev(6000,2000,'AAAAHHH!'),ev(8000,3000,'So how does that work?')]});
+// Separately timed native track: styled layers repeat cues, zero-width spaces pad text, one cue straddles a boundary.
+const nativeChinese=()=>JSON.stringify({events:[ev(0,2500,'​大多数人自己选'),ev(0,2500,'​大多数人自己选'),ev(2500,800,'初始宝可梦。'),ev(3300,2700,'其他人从博士那里得到。'),ev(8100,2800,'那是怎么回事？')]});
+const nativeTexts=h=>JSON.parse(h.results[0].body).events.filter(e=>e.segs).map(e=>e.segs[0].utf8);
+test('native Chinese subtitles are shown instead of translating; uncovered lines stay English only',()=>{
+ const h=harness('translate',{body:nativeEnglish(),native:{'zh-Hans':nativeChinese()}});
+ assert.equal(h.calls.length,0); assert.equal(h.results.length,1);
+ assert.deepEqual(nativeTexts(h),['大多数人自己选 初始宝可梦。\nMost people pick their starter.','其他人从博士那里得到。\nOthers get one from a professor.','AAAAHHH!','那是怎么回事？\nSo how does that work?']);
+ const line=h.logs.find(s=>s.includes('result='));assert.match(line,/result=NATIVE /);assert.match(line,/ native=zh-Hans:3 /);
+ const probe=h.gets.find(g=>g.options.url.includes('lang=zh-Hans'));
+ assert.equal(probe.options.headers['X-YTLoon'],'native');assert.equal(probe.options.headers['User-Agent'],'TEST_UA');assert.ok(probe.options.url.includes('signature=PRIVATE_SENTINEL'));
+ assert.equal(cacheText(h.store),undefined);assert.equal(h.store['ytloon.pending.v1'],undefined);
+});
+test('native Chinese works for new users who have not entered a key yet',()=>{
+ const h=harness('translate',{body:nativeEnglish(),store:{'ytloon.deepseek.key':''},native:{'zh-Hans':nativeChinese()}});
+ assert.equal(h.calls.length,0);assert.ok(h.logs.some(s=>s.includes('result=NATIVE')&&s.includes('key=none')));
+ assert.ok(nativeTexts(h)[0].startsWith('大多数人自己选'));
+});
+test('native track prefers Simplified, falls back to Traditional, then to DeepSeek',()=>{
+ const both=harness('translate',{body:nativeEnglish(),native:{'zh-Hans':nativeChinese(),'zh-Hant':nativeChinese().replace('其他人','其他人(繁)')}});
+ assert.ok(!nativeTexts(both).join().includes('(繁)'));
+ const hant=harness('translate',{body:nativeEnglish(),native:{'zh-Hant':nativeChinese().replace('其他人','其他人(繁)')}});
+ assert.ok(nativeTexts(hant).join().includes('(繁)'));assert.ok(hant.logs.some(s=>s.includes('native=zh-Hant:3')));
+ const none=harness('translate',{body:nativeEnglish()});assert.equal(none.calls.length,1);none.respond();
+ assert.ok(none.results[0].body.includes('译文'));assert.equal(none.logs.some(s=>s.includes('native=')),false);
+ assert.deepEqual(none.gets.map(g=>new URL(g.options.url).searchParams.get('lang')),['zh-Hans','zh-Hant','zh-CN','zh-TW','zh-HK','zh']);
+ const ja=harness('translate',{body:nativeEnglish(),args:{enabled:true,target:'ja'}});assert.deepEqual(ja.gets.map(g=>new URL(g.options.url).searchParams.get('lang')),['ja']);
+});
+test('slow or failing native probes fall back to DeepSeek after the probe timeout',()=>{
+ const h=harness('translate',{body:nativeEnglish(),holdNative:true});assert.equal(h.calls.length,0);
+ h.gets[0].cb('ETIMEDOUT',null,null);h.advance(4999);assert.equal(h.calls.length,0);
+ h.advance(1);assert.equal(h.calls.length,1);h.gets[1].cb(null,{status:200},nativeChinese());
+ h.respond();assert.ok(h.results[0].body.includes('译文'));assert.equal(h.results.length,1);
+ const broken=harness('translate',{body:nativeEnglish(),native:{'zh-Hans':'<html>not subtitles</html>'}});assert.equal(broken.calls.length,1);
+});
+test('the script passes its own native probe through and prewarm never probes',()=>{
+ const probe=harness('translate',{body:nativeChinese(),requestHeaders:{'x-ytloon':'native'}});
+ assert.deepEqual(probe.results,[{}]);assert.equal(probe.gets.length+probe.calls.length,0);assert.ok(probe.logs.some(s=>s.includes('result=NATIVE_PROBE')));
+ const h=harness('translate',{body:manyCues(30),noClearTimeout:true});h.deadline();
+ const w=harness('prewarm',{store:h.store});assert.equal(w.gets.length,0);assert.ok(w.calls.length>0);
+});
+// Styled SRV3 as on big channels: two layers per cue (pen 3/4), zero-width padding, dialogue that
+// moves between positions, and a native track with extra on-screen notes shown alongside dialogue.
+function styledSrv3(lines) {
+ const zw='&#8203;', layer=(t,d,wp,text,pen)=>'<p t="'+t+'" d="'+d+'" wp="'+wp+'" ws="1"><s p="1">'+zw+'</s><s>'+zw+'</s><s p="'+pen+'">'+text.split(' ').map((w,i)=>i?'</s><s p="'+pen+'" t="'+i*150+'">'+w+' ':w+zw+' '+zw+' ').join('')+'</s><s p="1" t="'+(text.split(' ').length*150)+'">'+zw+'</s></p>';
+ return '<?xml version="1.0" encoding="utf-8" ?><timedtext format="3"><head><pen id="1" fc="#000000"/><pen id="3" b="1" et="4"/><pen id="4" b="1" et="3"/><ws id="0"/><ws id="1" ju="2"/><wp id="0"/><wp id="1" ap="7" ah="50" av="98"/><wp id="2" ap="4" ah="50" av="78"/></head><body>'
+  + lines.map(([t,d,wp,text])=>layer(t,d,wp,text,3)+layer(t,d,wp,text,4)).join('') + '</body></timedtext>';
+}
+test('styled native track: both layers get the same Chinese and on-screen notes are left out',()=>{
+ const english=styledSrv3([[100,3534,1,'I am racing the fastest man'],[3667,1733,2,'and if I win'],[5467,1733,2,'I keep the money'],[7267,1967,2,'but if I lose'],[9300,2535,2,'he keeps it all'],[11868,1132,1,'Let us go']]);
+ const chinese=styledSrv3([[0,3367,1,'我要和最快的人赛跑'],[3434,1599,1,'如果我赢了'],[5100,1734,1,'钱归我'],[5300,1601,2,'第一站：体育场'],[6901,1800,1,'但如果我输了'],[6968,1733,2,'奖金：十万美元'],[8767,2633,1,'钱全归他'],[8801,1666,2,'计时开始'],[11467,1467,1,'出发吧']]);
+ const h=harness('translate',{body:english,native:{'zh-Hans':chinese}});
+ assert.equal(h.calls.length,0);assert.ok(h.logs.some(s=>/result=NATIVE .* native=zh-Hans:12 /.test(s)));
+ const cues=C.parse(h.results[0].body).cues.map(c=>c.text.replace(/​/g,'').replace(/\s+/g,' ').trim());
+ assert.equal(cues.length,12);
+ for(let i=0;i<12;i+=2) assert.equal(cues[i],cues[i+1]);
+ assert.deepEqual(cues.filter((_,i)=>i%2===0).map(t=>t.split(' ')[0]),['我要和最快的人赛跑','如果我赢了','钱归我','但如果我输了','钱全归他','出发吧']);
+ assert.equal(cues.some(t=>/体育场|十万美元|计时开始/.test(t)),false);
+});
+test('a video confirmed to have no native track and fully cached skips the probe next time',()=>{
+ const first=harness('translate',{body:nativeEnglish()});assert.equal(first.gets.length,6);first.respond();
+ assert.equal(JSON.parse(first.store[SHARD_KEY]).n,'zh');
+ const again=harness('translate',{body:nativeEnglish(),store:first.store});
+ assert.equal(again.gets.length,0);assert.equal(again.calls.length,0);assert.ok(again.results[0].body.includes('译文'));
+ // Partial cache still probes: the probe costs little next to the translation still needed.
+ const longer=harness('translate',{body:JSON.stringify({events:[...JSON.parse(nativeEnglish()).events,ev(12000,2000,'New line.')]}),store:first.store});
+ assert.equal(longer.gets.length,6);
+});
+test('a cache from before the flag is probed once, then flagged without retranslating',()=>{
+ const first=harness('translate',{body:nativeEnglish()});first.respond();
+ const legacy={...JSON.parse(first.store[SHARD_KEY])};delete legacy.n;
+ const probe=harness('translate',{body:nativeEnglish(),store:{...first.store,[SHARD_KEY]:JSON.stringify(legacy)}});
+ assert.equal(probe.gets.length,6);assert.equal(probe.calls.length,0);assert.equal(JSON.parse(probe.store[SHARD_KEY]).n,'zh');
+ assert.equal(harness('translate',{body:nativeEnglish(),store:probe.store}).gets.length,0);
+});
+test('timeouts never mark a video as lacking a native track; native always wins over an old cache',()=>{
+ const slow=harness('translate',{body:nativeEnglish(),holdNative:true});slow.advance(5000);slow.respond();
+ assert.equal(JSON.parse(slow.store[SHARD_KEY]).n,undefined);
+ assert.equal(harness('translate',{body:nativeEnglish(),store:slow.store}).gets.length,6);
+ // Translated by DeepSeek before native support: the shard is complete but unflagged, so the probe runs and native wins.
+ const native=harness('translate',{body:nativeEnglish(),store:slow.store,native:{'zh-Hans':nativeChinese()}});
+ assert.equal(native.calls.length,0);assert.ok(native.logs.some(s=>s.includes('result=NATIVE')));
+ assert.ok(nativeTexts(native)[0].startsWith('大多数人自己选'));
+});
+test('native URL swaps only the language and drops auto-caption and machine-translation markers',()=>{
+ const url='https://www.youtube.com/api/timedtext?v=x&caps=asr&kind=asr&lang=en&tlang=fr&fmt=srv3&pot=P&signature=S';
+ assert.equal(C.nativeURL(url,'zh-Hans'),'https://www.youtube.com/api/timedtext?v=x&caps=asr&lang=zh-Hans&fmt=srv3&pot=P&signature=S');
+ assert.equal(C.nativeURL('https://www.youtube.com/api/timedtext?v=x&kind=asr','zh-Hant'),'https://www.youtube.com/api/timedtext?v=x&lang=zh-Hant');
+ const aligned=C.alignNative(C.parse(nativeEnglish()).cues,C.parse(nativeChinese()).cues);
+ assert.deepEqual(Object.keys(aligned),['0','1','3']);for(const v of Object.values(aligned)) assert.equal(/​/.test(v),false);
 });
 test('bilingual output collapses source line breaks below the translation',()=>{
  const body='<timedtext format="3"><body><p t="0" d="3000">First line<br/>second line</p></body></timedtext>';
