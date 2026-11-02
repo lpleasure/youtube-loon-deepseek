@@ -130,14 +130,20 @@ var YTSubs = (function () {
   // Sentence reconstruction is restricted to word-timed JSON3 tracks.
   // No estimated character timings: unsupported timing remains unchanged.
   function srvSentenceParse(body, original) {
-    var events = [], windows = Object.create(null), estimated = false;
+    var starts = [], n = 0, events = [], windows = Object.create(null), estimated = false;
+    // Only line start times are collected up front, so the body is not copied per line.
+    body.replace(/<p\b([^>]*)>[\s\S]*?<\/p\s*>/g, function (_, attrs) { starts.push(Number(attr("<p " + attrs + ">", "t"))); return _; });
     body.replace(/<p\b([^>]*)>([\s\S]*?)<\/p\s*>/g, function (_, attrs, inner) {
-      var start = Number(attr("<p " + attrs + ">", "t")), duration = Number(attr("<p " + attrs + ">", "d"));
-      windows[attr("<p " + attrs + ">", "w") || "default"] = true;
+      var tag = "<p " + attrs + ">", start = starts[n], next = starts[++n], full = Number(attr(tag, "d"));
+      windows[attr(tag, "w") || "default"] = true;
+      // Auto captions keep a line on screen while the next ones roll in; its words belong
+      // only to the time before the next line starts.
+      var duration = next > start && next < start + full ? next - start : full;
       var spans = [], match, re = /<s\b([^>]*)>([\s\S]*?)<\/s\s*>/g;
       while ((match = re.exec(inner))) {
         var offset = attr("<s " + match[1] + ">", "t");
-        spans.push({offset: offset === undefined ? null : Number(offset), text: decode(match[2].replace(/<br\s*\/>/g, " "))});
+        // Auto captions omit t on a line's first word: it starts with the line.
+        spans.push({offset: offset === undefined ? (spans.length ? null : 0) : Number(offset), text: decode(match[2].replace(/<br\s*\/>/g, " "))});
       }
       if (!spans.length) spans = [{offset: 0, text: decode(inner.replace(/<br\s*\/>/g, " "))}];
       // Missing word timing is estimated inside the original cue only.
@@ -235,7 +241,7 @@ var YTSubs = (function () {
       var text = clean(e.segs.map(function (seg) { return seg.utf8; }).join(""));
       if (!text) return;
       if (!Number.isFinite(e.tStartMs) || e.tStartMs < 0 || !Number.isFinite(e.dDurationMs) || e.dDurationMs <= 0) fail("INVALID_TIMING");
-      cues.push({id: cues.length, index: index, text: text, startSeconds: e.tStartMs / 1000});
+      cues.push({id: cues.length, index: index, text: text, startSeconds: e.tStartMs / 1000, endSeconds: (e.tStartMs + e.dDurationMs) / 1000, window: e.wWinId + "|" + e.wpWinPosId});
     });
     return {format: "json3", cues: cues, render: function (translations) {
       if (!Object.keys(translations).length) return body;
@@ -306,7 +312,7 @@ var YTSubs = (function () {
       if (stack) fail("INVALID_XML");
       var text = clean(decode(inner.replace(/<br\s*\/>/g, "\n").replace(/<\/?s\b[^>]*>/g, "")));
       var openLength = match[0].indexOf(">") + 1;
-      if (text) cues.push({id: cues.length, text: text, startSeconds: Number(start[1]) / (isSrv ? 1000 : 1), begin: match.index + openLength, end: match.index + openLength + inner.length});
+      if (text) cues.push({id: cues.length, text: text, startSeconds: Number(start[1]) / (isSrv ? 1000 : 1), endSeconds: (Number(start[1]) + Number(duration[1])) / (isSrv ? 1000 : 1), window: attr("<p " + attrs + ">", "w") + "|" + attr("<p " + attrs + ">", "wp"), begin: match.index + openLength, end: match.index + openLength + inner.length});
       matches.push(match[0]);
     }
     // Reject unmatched cue tags and malformed root/body envelopes.
@@ -336,7 +342,7 @@ var YTSubs = (function () {
       if (seconds(m[2]) <= seconds(m[1])) fail("INVALID_TIMING");
       var raw = lines.slice(at + 1).join("\n");
       var text = clean(decode(raw.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ")));
-      if (text) cues.push({id: cues.length, index: index, text: text, startSeconds: seconds(m[1]), timingLine: at});
+      if (text) cues.push({id: cues.length, index: index, text: text, startSeconds: seconds(m[1]), endSeconds: seconds(m[2]), timingLine: at});
     });
     return {format: "vtt", cues: cues, render: function (translations) {
       var copy = blocks.slice();
@@ -410,12 +416,65 @@ var YTSubs = (function () {
     h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
     return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
   }
+  // The same signed request in another language: YouTube's signature does not cover lang.
+  // Drops kind (auto-generated) and tlang (YouTube machine translation) to get a native track.
+  function nativeURL(url, lang) {
+    var out = url.replace(/([?&])(?:tlang|kind)=[^&#]*&?/g, "$1").replace(/[?&]$/, "");
+    if (/[?&]lang=/.test(out)) return out.replace(/([?&]lang=)[^&#]*/, "$1" + encodeURIComponent(lang));
+    return out + (out.indexOf("?") < 0 ? "?" : "&") + "lang=" + encodeURIComponent(lang);
+  }
+  // Pairs a native target-language track with source cues by time. Each native cue goes to the
+  // source cue holding its midpoint, else to the neighbour it overlaps most; tracks segment
+  // differently, so several may join one cue. Source cues left without one stay source-only.
+  function alignNative(cues, native) {
+    // Styled tracks repeat each cue once per outline/shadow layer; all layers share one span.
+    var groups = Object.create(null), spans = [];
+    cues.forEach(function (c) {
+      var key = c.startSeconds + "|" + c.text;
+      if (groups[key]) return groups[key].ids.push(c.id);
+      spans.push(groups[key] = {ids: [c.id], start: c.startSeconds, end: Number.isFinite(c.endSeconds) ? c.endSeconds : Infinity, texts: []});
+    });
+    spans.sort(function (a, b) { return a.start - b.start || a.ids[0] - b.ids[0]; });
+    spans.forEach(function (s, i) {
+      for (var j = i + 1; j < spans.length && spans[j].start <= s.start; j++);
+      if (spans[j] && spans[j].start < s.end) s.end = spans[j].start;
+      s.end = Math.max(Number.isFinite(s.end) ? s.end : s.start + 5, s.start + 0.001);
+    });
+    var seen = Object.create(null), out = Object.create(null), items = [], windows = Object.create(null), main;
+    native.forEach(function (n) {
+      var text = n.text.replace(/[\u200b-\u200d\u2060\ufeff]/g, "").replace(/\s+/g, " ").trim(), key = n.startSeconds + "|" + text;
+      if (!text || seen[key]) return;
+      seen[key] = true; // Native styled tracks repeat cues per layer too.
+      var end = Number.isFinite(n.endSeconds) ? n.endSeconds : n.startSeconds + 2;
+      items.push({start: n.startSeconds, end: Math.max(end, n.startSeconds + 0.001), text: text, window: n.window});
+      windows[n.window] = (windows[n.window] || 0) + 1;
+    });
+    // Cues in another position that show at the same time as the main (dialogue) position are
+    // on-screen text notes the source track does not carry; they are left out.
+    Object.keys(windows).forEach(function (w) { if (!main || windows[w] > windows[main]) main = w; });
+    var dialogue = items.filter(function (n) { return n.window === main; });
+    items.forEach(function (n) {
+      if (n.window !== main && dialogue.some(function (d) { return Math.min(d.end, n.end) - Math.max(d.start, n.start) > (n.end - n.start) / 2; })) return;
+      var mid = (n.start + n.end) / 2, lo = 0, hi = spans.length - 1, at = -1, best = null, most = 0;
+      while (lo <= hi) { var m = (lo + hi) >> 1; if (spans[m].start <= mid) { at = m; lo = m + 1; } else hi = m - 1; }
+      if (at >= 0 && mid < spans[at].end) best = spans[at];
+      else [spans[at], spans[at + 1]].forEach(function (s) {
+        var overlap = s ? Math.min(s.end, n.end) - Math.max(s.start, n.start) : 0;
+        if (overlap > most) { most = overlap; best = s; }
+      });
+      if (best && best.texts[best.texts.length - 1] !== n.text) best.texts.push(n.text);
+    });
+    spans.forEach(function (s) {
+      if (s.texts.length) s.ids.forEach(function (id) { out[id] = s.texts.join(" ").slice(0, 1600); });
+    });
+    return out;
+  }
   // One cache shard per video; tracks without a usable video ID fall back to their text.
   function trackID(url, cues) {
     var v = query(url, "v");
     if (/^[A-Za-z0-9_-]{6,64}$/.test(v)) return "v" + v;
     return "h" + hash(cues.slice(0, 200).map(function (c) { return c.text; }).join("\n"));
   }
-  return {URL_RE: URL_RE, parse: parse, sameLanguage: sameLanguage, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size, hash: hash, trackID: trackID};
+  return {URL_RE: URL_RE, parse: parse, sameLanguage: sameLanguage, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size, hash: hash, trackID: trackID, primaryLanguage: primaryLanguage, nativeURL: nativeURL, alignNative: alignNative};
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;

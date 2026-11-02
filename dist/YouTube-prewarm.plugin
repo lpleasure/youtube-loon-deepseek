@@ -1,4 +1,4 @@
 #!name = YouTube 最近字幕预翻译
-#!desc = 1.2.0；手动运行，最长约 270 秒；完成后重新请求字幕
+#!desc = 1.3.0；手动运行，最长约 270 秒；完成后重新请求字幕
 [Script]
 generic then script("yt-prewarm.js") with timeout=300, tag="YTSubs prewarm"

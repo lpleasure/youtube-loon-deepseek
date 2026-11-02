@@ -8,7 +8,11 @@
   // whole history; the small index only tracks expiry and size for eviction.
   var LEGACY_CACHE = "ytloon.cache.v1", INDEX = "ytloon.index.v2", SHARD = "ytloon.shard.v2.", LOCK = "ytloon.lock.v2.";
   var CACHE_TTL = 7 * 86400000, CACHE_BUDGET = 6291456, MAX_SHARDS = 400, CHECKPOINT = 96, WAIT_MS = 1000;
-  var done = false, keySource = "none", timer, doc, track, lockValue, stored, translations = {}, additions = [], started = Date.now(), waitedMS = 0, trackEntries = 0;
+  // Marks this script's own native-track requests; a URL parameter would void YouTube's signature.
+  var NATIVE_HEADER = "X-YTLoon", NATIVE_MS = 5000;
+  var done = false, keySource = "none", timer, doc, track, lockValue, stored, native = "", translations = {}, additions = [], started = Date.now(), waitedMS = 0, trackEntries = 0;
+  // shardNative: language a shard records as having no native track; noNative: newly confirmed now.
+  var shardNative, noNative;
   var counts = {cached: 0, sent: 0, translated: 0, failed: 0};
   var DEADLINE_MS = prewarm ? 270000 : 22000, REQUEST_MS = prewarm ? 30000 : 12000, MIN_REQUEST_MS = 4000, RETRY_MS = 750, MAX_CALLS = 4, concurrency = 8;
   function remaining() { return DEADLINE_MS - 500 - (Date.now() - started); }
@@ -50,7 +54,9 @@
   }
   function loadShard() {
     var shard = readJSON(SHARD + track, null), entries = Object.create(null);
+    shardNative = undefined;
     if (!shard || !(shard.e > Date.now()) || !shard.t || typeof shard.t !== "object") return entries;
+    if (typeof shard.n === "string") shardNative = shard.n;
     Object.keys(shard.t).forEach(function (k) {
       if (typeof shard.t[k] === "string" && shard.t[k].length <= 1600) entries[k] = shard.t[k];
     });
@@ -72,15 +78,18 @@
     if (!write(INDEX, JSON.stringify(index))) log("index_write_failed");
   }
   function saveCache(reload) {
-    if (!additions.length || !track) return;
+    if ((!additions.length && !noNative) || !track) return;
     // Checkpoints reuse the shard already in memory (the lock keeps other runs from writing it);
     // the final save reloads once to keep entries a racing execution saved. No transactions in Loon.
     var entries = reload || !stored ? loadShard() : stored;
+    // The flag alone is only worth a write for an existing shard (e.g. one cached before it existed).
+    if (!additions.length && (shardNative === noNative || !Object.keys(entries).length)) return;
     additions.forEach(function (r) { entries[r.k] = r.v; });
     stored = entries;
-    var text = JSON.stringify({e: Date.now() + CACHE_TTL, t: entries});
+    var text = JSON.stringify({e: Date.now() + CACHE_TTL, t: entries, n: noNative || shardNative});
     if (!write(SHARD + track, text)) { log("cache_write_failed"); return; }
     additions = [];
+    if (noNative) shardNative = noNative;
     trackEntries = Object.keys(entries).length;
     updateIndex(YTSubs.utf8size(text));
   }
@@ -94,10 +103,16 @@
       if (!prewarm && doc && Object.keys(translations).length) response = {body: doc.render(translations), headers: YTSubs.headers(responseContext.headers)};
     } catch (_) { response = {}; reason = "OUTPUT_ERROR"; }
     if (lockValue && read(LOCK + track) === lockValue) write(LOCK + track, undefined);
-    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.2.0 elapsed_ms=" + (Date.now() - started));
+    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + (native ? " native=" + native : "") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.3.0 elapsed_ms=" + (Date.now() - started));
     $done(response);
   }
+  function header(headers, name) {
+    var value;
+    Object.keys(headers || {}).some(function (key) { if (key.toLowerCase() !== name.toLowerCase()) return false; value = headers[key]; return true; });
+    return value;
+  }
   try {
+    if (!prewarm && header(requestContext.headers, NATIVE_HEADER) === "native") return finish("NATIVE_PROBE");
     if (prewarm) {
       snapshot = readJSON(SNAPSHOT, null);
       if (!snapshot || snapshot.expires <= Date.now() || typeof snapshot.body !== "string" || !snapshot.cfg || typeof snapshot.source !== "string" || typeof snapshot.track !== "string") return finish("NO_PENDING_TRACK");
@@ -123,6 +138,51 @@
     retireLegacyCache();
     var namespace = doc.sentenceMode && doc.format === "srv3" ? "prompt-srv3-sentence-v1" : "prompt-v1";
     doc.cues.forEach(function (c) { c.key = YTSubs.hash(JSON.stringify([namespace, cfg.model, cfg.target, source, c.text])); });
+    var cached = loadShard(), nativeKey = YTSubs.primaryLanguage(cfg.target);
+    // A video already confirmed to have no native track and fully cached skips the probe.
+    var known = shardNative === nativeKey && doc.cues.every(function (c) { return cached[c.key] || c.text.length > 800; });
+    if (prewarm || known) proceed(cached); else fetchNative(function () { proceed(); });
+  } catch (e) { finish(e.code || "SCRIPT_ERROR"); }
+  // When the video has its own subtitles in the target language, show those above the source
+  // instead of translating: no API call. Source cues they do not cover stay source-only.
+  function fetchNative(next) {
+    var langs = [cfg.target].concat(YTSubs.primaryLanguage(cfg.target) === "zh" ? ["zh-Hans", "zh-Hant", "zh-CN", "zh-TW", "zh-HK", "zh"] : []), seen = {};
+    langs = langs.filter(function (lang) { var k = lang.toLowerCase(); return !seen[k] && (seen[k] = true); });
+    var bodies = [], pending = langs.length, ua = header(requestContext.headers, "User-Agent");
+    langs.forEach(function (lang, i) {
+      var settled = false, wait = setTimeout(function () { settle(null); }, NATIVE_MS);
+      function settle(body) {
+        if (settled) return;
+        settled = true;
+        if (typeof clearTimeout === "function") clearTimeout(wait);
+        bodies[i] = body;
+        if (--pending === 0) pick();
+      }
+      var headers = {}; headers[NATIVE_HEADER] = "native"; if (ua) headers["User-Agent"] = ua;
+      try {
+        $httpClient.get({url: YTSubs.nativeURL(requestContext.url, lang), timeout: NATIVE_MS, headers: headers}, function (error, response, data) {
+          // An empty 200 means YouTube has no such track; errors and timeouts settle as null.
+          settle(!error && YTSubs.statusOK(response) && typeof data === "string" ? data : null);
+        });
+      } catch (_) { settle(null); }
+    });
+    function pick() {
+      if (done) return;
+      for (var i = 0; i < langs.length; i++) {
+        if (!bodies[i] || !bodies[i].trim()) continue;
+        try {
+          var aligned = YTSubs.alignNative(doc.cues, YTSubs.parse(bodies[i]).cues), matched = Object.keys(aligned).length;
+          if (matched) { bodies = null; translations = aligned; native = langs[i] + ":" + matched; return finish("NATIVE"); }
+        } catch (_) {}
+      }
+      // Only when every probe answered empty is the video known to lack a native track.
+      if (bodies.every(function (b) { return typeof b === "string" && !b.trim(); })) noNative = YTSubs.primaryLanguage(cfg.target);
+      bodies = null;
+      next();
+    }
+  }
+  function proceed(preloaded) {
+   try {
     var missing = [], aliases = Object.create(null);
     function collect(entries) {
       var unique = Object.create(null);
@@ -137,7 +197,8 @@
       });
       trackEntries = Math.max(trackEntries, Object.keys(entries).length);
     }
-    collect(loadShard());
+    // After a probe the shard is read again: another run may have saved meanwhile.
+    collect(preloaded || loadShard());
     if (!prewarm && missing.length) {
       var pendingID = [track, responseContext.body.length, source, cfg.target, cfg.model].join("|"), previous = readJSON(SNAPSHOT_ID, {});
       // Repeated requests for one track must not rewrite a multi-MB snapshot every time.
@@ -295,5 +356,6 @@
       } catch (e) { callback(e, null, null); }
     }
     if (peerBusy()) waitForPeer(); else start();
-  } catch (e) { finish(e.code || "SCRIPT_ERROR"); }
+   } catch (e) { finish(e.code || "SCRIPT_ERROR"); }
+  }
 })();

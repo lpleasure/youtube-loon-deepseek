@@ -1,4 +1,4 @@
-/* YT Loon 1.2.0. Generated: edit src/, run npm run build. */
+/* YT Loon 1.3.0. Generated: edit src/, run npm run build. */
 /* Original implementation. No dependencies; shared by Node tests and Loon bundles. */
 var YTSubs = (function () {
   "use strict";
@@ -131,14 +131,20 @@ var YTSubs = (function () {
   // Sentence reconstruction is restricted to word-timed JSON3 tracks.
   // No estimated character timings: unsupported timing remains unchanged.
   function srvSentenceParse(body, original) {
-    var events = [], windows = Object.create(null), estimated = false;
+    var starts = [], n = 0, events = [], windows = Object.create(null), estimated = false;
+    // Only line start times are collected up front, so the body is not copied per line.
+    body.replace(/<p\b([^>]*)>[\s\S]*?<\/p\s*>/g, function (_, attrs) { starts.push(Number(attr("<p " + attrs + ">", "t"))); return _; });
     body.replace(/<p\b([^>]*)>([\s\S]*?)<\/p\s*>/g, function (_, attrs, inner) {
-      var start = Number(attr("<p " + attrs + ">", "t")), duration = Number(attr("<p " + attrs + ">", "d"));
-      windows[attr("<p " + attrs + ">", "w") || "default"] = true;
+      var tag = "<p " + attrs + ">", start = starts[n], next = starts[++n], full = Number(attr(tag, "d"));
+      windows[attr(tag, "w") || "default"] = true;
+      // Auto captions keep a line on screen while the next ones roll in; its words belong
+      // only to the time before the next line starts.
+      var duration = next > start && next < start + full ? next - start : full;
       var spans = [], match, re = /<s\b([^>]*)>([\s\S]*?)<\/s\s*>/g;
       while ((match = re.exec(inner))) {
         var offset = attr("<s " + match[1] + ">", "t");
-        spans.push({offset: offset === undefined ? null : Number(offset), text: decode(match[2].replace(/<br\s*\/>/g, " "))});
+        // Auto captions omit t on a line's first word: it starts with the line.
+        spans.push({offset: offset === undefined ? (spans.length ? null : 0) : Number(offset), text: decode(match[2].replace(/<br\s*\/>/g, " "))});
       }
       if (!spans.length) spans = [{offset: 0, text: decode(inner.replace(/<br\s*\/>/g, " "))}];
       // Missing word timing is estimated inside the original cue only.
@@ -236,7 +242,7 @@ var YTSubs = (function () {
       var text = clean(e.segs.map(function (seg) { return seg.utf8; }).join(""));
       if (!text) return;
       if (!Number.isFinite(e.tStartMs) || e.tStartMs < 0 || !Number.isFinite(e.dDurationMs) || e.dDurationMs <= 0) fail("INVALID_TIMING");
-      cues.push({id: cues.length, index: index, text: text, startSeconds: e.tStartMs / 1000});
+      cues.push({id: cues.length, index: index, text: text, startSeconds: e.tStartMs / 1000, endSeconds: (e.tStartMs + e.dDurationMs) / 1000, window: e.wWinId + "|" + e.wpWinPosId});
     });
     return {format: "json3", cues: cues, render: function (translations) {
       if (!Object.keys(translations).length) return body;
@@ -307,7 +313,7 @@ var YTSubs = (function () {
       if (stack) fail("INVALID_XML");
       var text = clean(decode(inner.replace(/<br\s*\/>/g, "\n").replace(/<\/?s\b[^>]*>/g, "")));
       var openLength = match[0].indexOf(">") + 1;
-      if (text) cues.push({id: cues.length, text: text, startSeconds: Number(start[1]) / (isSrv ? 1000 : 1), begin: match.index + openLength, end: match.index + openLength + inner.length});
+      if (text) cues.push({id: cues.length, text: text, startSeconds: Number(start[1]) / (isSrv ? 1000 : 1), endSeconds: (Number(start[1]) + Number(duration[1])) / (isSrv ? 1000 : 1), window: attr("<p " + attrs + ">", "w") + "|" + attr("<p " + attrs + ">", "wp"), begin: match.index + openLength, end: match.index + openLength + inner.length});
       matches.push(match[0]);
     }
     // Reject unmatched cue tags and malformed root/body envelopes.
@@ -337,7 +343,7 @@ var YTSubs = (function () {
       if (seconds(m[2]) <= seconds(m[1])) fail("INVALID_TIMING");
       var raw = lines.slice(at + 1).join("\n");
       var text = clean(decode(raw.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ")));
-      if (text) cues.push({id: cues.length, index: index, text: text, startSeconds: seconds(m[1]), timingLine: at});
+      if (text) cues.push({id: cues.length, index: index, text: text, startSeconds: seconds(m[1]), endSeconds: seconds(m[2]), timingLine: at});
     });
     return {format: "vtt", cues: cues, render: function (translations) {
       var copy = blocks.slice();
@@ -411,13 +417,66 @@ var YTSubs = (function () {
     h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
     return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
   }
+  // The same signed request in another language: YouTube's signature does not cover lang.
+  // Drops kind (auto-generated) and tlang (YouTube machine translation) to get a native track.
+  function nativeURL(url, lang) {
+    var out = url.replace(/([?&])(?:tlang|kind)=[^&#]*&?/g, "$1").replace(/[?&]$/, "");
+    if (/[?&]lang=/.test(out)) return out.replace(/([?&]lang=)[^&#]*/, "$1" + encodeURIComponent(lang));
+    return out + (out.indexOf("?") < 0 ? "?" : "&") + "lang=" + encodeURIComponent(lang);
+  }
+  // Pairs a native target-language track with source cues by time. Each native cue goes to the
+  // source cue holding its midpoint, else to the neighbour it overlaps most; tracks segment
+  // differently, so several may join one cue. Source cues left without one stay source-only.
+  function alignNative(cues, native) {
+    // Styled tracks repeat each cue once per outline/shadow layer; all layers share one span.
+    var groups = Object.create(null), spans = [];
+    cues.forEach(function (c) {
+      var key = c.startSeconds + "|" + c.text;
+      if (groups[key]) return groups[key].ids.push(c.id);
+      spans.push(groups[key] = {ids: [c.id], start: c.startSeconds, end: Number.isFinite(c.endSeconds) ? c.endSeconds : Infinity, texts: []});
+    });
+    spans.sort(function (a, b) { return a.start - b.start || a.ids[0] - b.ids[0]; });
+    spans.forEach(function (s, i) {
+      for (var j = i + 1; j < spans.length && spans[j].start <= s.start; j++);
+      if (spans[j] && spans[j].start < s.end) s.end = spans[j].start;
+      s.end = Math.max(Number.isFinite(s.end) ? s.end : s.start + 5, s.start + 0.001);
+    });
+    var seen = Object.create(null), out = Object.create(null), items = [], windows = Object.create(null), main;
+    native.forEach(function (n) {
+      var text = n.text.replace(/[\u200b-\u200d\u2060\ufeff]/g, "").replace(/\s+/g, " ").trim(), key = n.startSeconds + "|" + text;
+      if (!text || seen[key]) return;
+      seen[key] = true; // Native styled tracks repeat cues per layer too.
+      var end = Number.isFinite(n.endSeconds) ? n.endSeconds : n.startSeconds + 2;
+      items.push({start: n.startSeconds, end: Math.max(end, n.startSeconds + 0.001), text: text, window: n.window});
+      windows[n.window] = (windows[n.window] || 0) + 1;
+    });
+    // Cues in another position that show at the same time as the main (dialogue) position are
+    // on-screen text notes the source track does not carry; they are left out.
+    Object.keys(windows).forEach(function (w) { if (!main || windows[w] > windows[main]) main = w; });
+    var dialogue = items.filter(function (n) { return n.window === main; });
+    items.forEach(function (n) {
+      if (n.window !== main && dialogue.some(function (d) { return Math.min(d.end, n.end) - Math.max(d.start, n.start) > (n.end - n.start) / 2; })) return;
+      var mid = (n.start + n.end) / 2, lo = 0, hi = spans.length - 1, at = -1, best = null, most = 0;
+      while (lo <= hi) { var m = (lo + hi) >> 1; if (spans[m].start <= mid) { at = m; lo = m + 1; } else hi = m - 1; }
+      if (at >= 0 && mid < spans[at].end) best = spans[at];
+      else [spans[at], spans[at + 1]].forEach(function (s) {
+        var overlap = s ? Math.min(s.end, n.end) - Math.max(s.start, n.start) : 0;
+        if (overlap > most) { most = overlap; best = s; }
+      });
+      if (best && best.texts[best.texts.length - 1] !== n.text) best.texts.push(n.text);
+    });
+    spans.forEach(function (s) {
+      if (s.texts.length) s.ids.forEach(function (id) { out[id] = s.texts.join(" ").slice(0, 1600); });
+    });
+    return out;
+  }
   // One cache shard per video; tracks without a usable video ID fall back to their text.
   function trackID(url, cues) {
     var v = query(url, "v");
     if (/^[A-Za-z0-9_-]{6,64}$/.test(v)) return "v" + v;
     return "h" + hash(cues.slice(0, 200).map(function (c) { return c.text; }).join("\n"));
   }
-  return {URL_RE: URL_RE, parse: parse, sameLanguage: sameLanguage, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size, hash: hash, trackID: trackID};
+  return {URL_RE: URL_RE, parse: parse, sameLanguage: sameLanguage, sentenceParse: sentenceParse, query: query, statusOK: statusOK, headers: headers, args: args, validateReply: validateReply, utf8size: utf8size, hash: hash, trackID: trackID, primaryLanguage: primaryLanguage, nativeURL: nativeURL, alignNative: alignNative};
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
 
@@ -431,7 +490,11 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
   // whole history; the small index only tracks expiry and size for eviction.
   var LEGACY_CACHE = "ytloon.cache.v1", INDEX = "ytloon.index.v2", SHARD = "ytloon.shard.v2.", LOCK = "ytloon.lock.v2.";
   var CACHE_TTL = 7 * 86400000, CACHE_BUDGET = 6291456, MAX_SHARDS = 400, CHECKPOINT = 96, WAIT_MS = 1000;
-  var done = false, keySource = "none", timer, doc, track, lockValue, stored, translations = {}, additions = [], started = Date.now(), waitedMS = 0, trackEntries = 0;
+  // Marks this script's own native-track requests; a URL parameter would void YouTube's signature.
+  var NATIVE_HEADER = "X-YTLoon", NATIVE_MS = 5000;
+  var done = false, keySource = "none", timer, doc, track, lockValue, stored, native = "", translations = {}, additions = [], started = Date.now(), waitedMS = 0, trackEntries = 0;
+  // shardNative: language a shard records as having no native track; noNative: newly confirmed now.
+  var shardNative, noNative;
   var counts = {cached: 0, sent: 0, translated: 0, failed: 0};
   var DEADLINE_MS = prewarm ? 270000 : 22000, REQUEST_MS = prewarm ? 30000 : 12000, MIN_REQUEST_MS = 4000, RETRY_MS = 750, MAX_CALLS = 4, concurrency = 8;
   function remaining() { return DEADLINE_MS - 500 - (Date.now() - started); }
@@ -473,7 +536,9 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
   }
   function loadShard() {
     var shard = readJSON(SHARD + track, null), entries = Object.create(null);
+    shardNative = undefined;
     if (!shard || !(shard.e > Date.now()) || !shard.t || typeof shard.t !== "object") return entries;
+    if (typeof shard.n === "string") shardNative = shard.n;
     Object.keys(shard.t).forEach(function (k) {
       if (typeof shard.t[k] === "string" && shard.t[k].length <= 1600) entries[k] = shard.t[k];
     });
@@ -495,15 +560,18 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
     if (!write(INDEX, JSON.stringify(index))) log("index_write_failed");
   }
   function saveCache(reload) {
-    if (!additions.length || !track) return;
+    if ((!additions.length && !noNative) || !track) return;
     // Checkpoints reuse the shard already in memory (the lock keeps other runs from writing it);
     // the final save reloads once to keep entries a racing execution saved. No transactions in Loon.
     var entries = reload || !stored ? loadShard() : stored;
+    // The flag alone is only worth a write for an existing shard (e.g. one cached before it existed).
+    if (!additions.length && (shardNative === noNative || !Object.keys(entries).length)) return;
     additions.forEach(function (r) { entries[r.k] = r.v; });
     stored = entries;
-    var text = JSON.stringify({e: Date.now() + CACHE_TTL, t: entries});
+    var text = JSON.stringify({e: Date.now() + CACHE_TTL, t: entries, n: noNative || shardNative});
     if (!write(SHARD + track, text)) { log("cache_write_failed"); return; }
     additions = [];
+    if (noNative) shardNative = noNative;
     trackEntries = Object.keys(entries).length;
     updateIndex(YTSubs.utf8size(text));
   }
@@ -517,10 +585,16 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
       if (!prewarm && doc && Object.keys(translations).length) response = {body: doc.render(translations), headers: YTSubs.headers(responseContext.headers)};
     } catch (_) { response = {}; reason = "OUTPUT_ERROR"; }
     if (lockValue && read(LOCK + track) === lockValue) write(LOCK + track, undefined);
-    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.2.0 elapsed_ms=" + (Date.now() - started));
+    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + (native ? " native=" + native : "") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.3.0 elapsed_ms=" + (Date.now() - started));
     $done(response);
   }
+  function header(headers, name) {
+    var value;
+    Object.keys(headers || {}).some(function (key) { if (key.toLowerCase() !== name.toLowerCase()) return false; value = headers[key]; return true; });
+    return value;
+  }
   try {
+    if (!prewarm && header(requestContext.headers, NATIVE_HEADER) === "native") return finish("NATIVE_PROBE");
     if (prewarm) {
       snapshot = readJSON(SNAPSHOT, null);
       if (!snapshot || snapshot.expires <= Date.now() || typeof snapshot.body !== "string" || !snapshot.cfg || typeof snapshot.source !== "string" || typeof snapshot.track !== "string") return finish("NO_PENDING_TRACK");
@@ -546,6 +620,51 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
     retireLegacyCache();
     var namespace = doc.sentenceMode && doc.format === "srv3" ? "prompt-srv3-sentence-v1" : "prompt-v1";
     doc.cues.forEach(function (c) { c.key = YTSubs.hash(JSON.stringify([namespace, cfg.model, cfg.target, source, c.text])); });
+    var cached = loadShard(), nativeKey = YTSubs.primaryLanguage(cfg.target);
+    // A video already confirmed to have no native track and fully cached skips the probe.
+    var known = shardNative === nativeKey && doc.cues.every(function (c) { return cached[c.key] || c.text.length > 800; });
+    if (prewarm || known) proceed(cached); else fetchNative(function () { proceed(); });
+  } catch (e) { finish(e.code || "SCRIPT_ERROR"); }
+  // When the video has its own subtitles in the target language, show those above the source
+  // instead of translating: no API call. Source cues they do not cover stay source-only.
+  function fetchNative(next) {
+    var langs = [cfg.target].concat(YTSubs.primaryLanguage(cfg.target) === "zh" ? ["zh-Hans", "zh-Hant", "zh-CN", "zh-TW", "zh-HK", "zh"] : []), seen = {};
+    langs = langs.filter(function (lang) { var k = lang.toLowerCase(); return !seen[k] && (seen[k] = true); });
+    var bodies = [], pending = langs.length, ua = header(requestContext.headers, "User-Agent");
+    langs.forEach(function (lang, i) {
+      var settled = false, wait = setTimeout(function () { settle(null); }, NATIVE_MS);
+      function settle(body) {
+        if (settled) return;
+        settled = true;
+        if (typeof clearTimeout === "function") clearTimeout(wait);
+        bodies[i] = body;
+        if (--pending === 0) pick();
+      }
+      var headers = {}; headers[NATIVE_HEADER] = "native"; if (ua) headers["User-Agent"] = ua;
+      try {
+        $httpClient.get({url: YTSubs.nativeURL(requestContext.url, lang), timeout: NATIVE_MS, headers: headers}, function (error, response, data) {
+          // An empty 200 means YouTube has no such track; errors and timeouts settle as null.
+          settle(!error && YTSubs.statusOK(response) && typeof data === "string" ? data : null);
+        });
+      } catch (_) { settle(null); }
+    });
+    function pick() {
+      if (done) return;
+      for (var i = 0; i < langs.length; i++) {
+        if (!bodies[i] || !bodies[i].trim()) continue;
+        try {
+          var aligned = YTSubs.alignNative(doc.cues, YTSubs.parse(bodies[i]).cues), matched = Object.keys(aligned).length;
+          if (matched) { bodies = null; translations = aligned; native = langs[i] + ":" + matched; return finish("NATIVE"); }
+        } catch (_) {}
+      }
+      // Only when every probe answered empty is the video known to lack a native track.
+      if (bodies.every(function (b) { return typeof b === "string" && !b.trim(); })) noNative = YTSubs.primaryLanguage(cfg.target);
+      bodies = null;
+      next();
+    }
+  }
+  function proceed(preloaded) {
+   try {
     var missing = [], aliases = Object.create(null);
     function collect(entries) {
       var unique = Object.create(null);
@@ -560,7 +679,8 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
       });
       trackEntries = Math.max(trackEntries, Object.keys(entries).length);
     }
-    collect(loadShard());
+    // After a probe the shard is read again: another run may have saved meanwhile.
+    collect(preloaded || loadShard());
     if (!prewarm && missing.length) {
       var pendingID = [track, responseContext.body.length, source, cfg.target, cfg.model].join("|"), previous = readJSON(SNAPSHOT_ID, {});
       // Repeated requests for one track must not rewrite a multi-MB snapshot every time.
@@ -718,5 +838,6 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
       } catch (e) { callback(e, null, null); }
     }
     if (peerBusy()) waitForPeer(); else start();
-  } catch (e) { finish(e.code || "SCRIPT_ERROR"); }
+   } catch (e) { finish(e.code || "SCRIPT_ERROR"); }
+  }
 })();
