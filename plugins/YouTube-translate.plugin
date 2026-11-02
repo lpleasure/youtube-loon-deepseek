@@ -1,14 +1,15 @@
 #!name = YouTube DeepSeek 双语字幕
-#!desc = 1.1.1；中文在上、原文在下；与其他字幕重写插件互斥；密钥只存本地
+#!desc = 1.2.0；中文在上、原文在下；与其他字幕重写插件互斥；密钥只存本地
 #!system = iOS,iPadOS
-#!date = 2026-11-01
+#!date = 2026-11-03
 #!loon_version = 3.5.1(983)
 [Argument]
 enabled = switch,false,type=boolean,tag=允许翻译,desc=启用双语字幕
 target = input,"zh-Hans",type=string,tag=目标语言
 model = input,"deepseek-flash",type=string,tag=DeepSeek 模型
+api_key = input,"",type=string,tag=DeepSeek Key,desc=只保存在本机 Loon；截图或分享日志、配置前请遮住
 [Script]
-response if ${url} ~= /^https:\/\/(?:www\.youtube\.com|m\.youtube\.com|youtube\.com|video\.google\.com)\/api\/timedtext(?:\?|$)/ then script("https://raw.githubusercontent.com/lpleasure/youtube-loon-deepseek/main/dist/yt-translate.js", {${enabled}, ${target}, ${model}}) with requires_body=true, binary_body_mode=false, timeout=25, tag="YTSubs translate"
+response if ${url} ~= /^https:\/\/(?:www\.youtube\.com|m\.youtube\.com|youtube\.com|video\.google\.com)\/api\/timedtext(?:\?|$)/ then script("https://raw.githubusercontent.com/lpleasure/youtube-loon-deepseek/main/dist/yt-translate.js", {${enabled}, ${target}, ${model}, ${api_key}}) with requires_body=true, binary_body_mode=false, timeout=25, tag="YTSubs translate"
 
 [Mitm]
 hostname = www.youtube.com, m.youtube.com, youtube.com, video.google.com

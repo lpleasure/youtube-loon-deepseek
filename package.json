@@ -1,6 +1,6 @@
 {
   "name": "youtube-loon-deepseek",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "private": true,
   "description": "YouTube bilingual subtitles for Loon with DeepSeek",
   "scripts": {

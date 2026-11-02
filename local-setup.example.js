@@ -1,4 +1,5 @@
-/* Copy to a NEW LOCAL Loon script. Do not edit a GitHub-hosted file with your key.
+/* Optional since 1.2.0: the key can be typed in the plugin settings instead.
+ * Copy to a NEW LOCAL Loon script. Do not edit a GitHub-hosted file with your key.
  * Run manually once; then erase the key from this editor copy and delete the local setup script.
  * The value remains in Loon script storage, not iOS Keychain. Never share Loon backups containing it.
  */

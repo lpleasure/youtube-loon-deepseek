@@ -1,4 +1,4 @@
-/* YT Loon 1.1.1. Generated: edit src/, run npm run build. */
+/* YT Loon 1.2.0. Generated: edit src/, run npm run build. */
 /* Original implementation. No dependencies; shared by Node tests and Loon bundles. */
 var YTSubs = (function () {
   "use strict";
@@ -431,7 +431,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
   // whole history; the small index only tracks expiry and size for eviction.
   var LEGACY_CACHE = "ytloon.cache.v1", INDEX = "ytloon.index.v2", SHARD = "ytloon.shard.v2.", LOCK = "ytloon.lock.v2.";
   var CACHE_TTL = 7 * 86400000, CACHE_BUDGET = 6291456, MAX_SHARDS = 400, CHECKPOINT = 96, WAIT_MS = 1000;
-  var done = false, timer, doc, track, lockValue, stored, translations = {}, additions = [], started = Date.now(), waitedMS = 0, trackEntries = 0;
+  var done = false, keySource = "none", timer, doc, track, lockValue, stored, translations = {}, additions = [], started = Date.now(), waitedMS = 0, trackEntries = 0;
   var counts = {cached: 0, sent: 0, translated: 0, failed: 0};
   var DEADLINE_MS = prewarm ? 270000 : 22000, REQUEST_MS = prewarm ? 30000 : 12000, MIN_REQUEST_MS = 4000, RETRY_MS = 750, MAX_CALLS = 4, concurrency = 8;
   function remaining() { return DEADLINE_MS - 500 - (Date.now() - started); }
@@ -517,7 +517,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
       if (!prewarm && doc && Object.keys(translations).length) response = {body: doc.render(translations), headers: YTSubs.headers(responseContext.headers)};
     } catch (_) { response = {}; reason = "OUTPUT_ERROR"; }
     if (lockValue && read(LOCK + track) === lockValue) write(LOCK + track, undefined);
-    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " version=1.1.1 elapsed_ms=" + (Date.now() - started));
+    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.2.0 elapsed_ms=" + (Date.now() - started));
     $done(response);
   }
   try {
@@ -531,6 +531,8 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
     doc = YTSubs.sentenceParse(responseContext.body);
     if (!doc.cues.length) return finish("NO_CUES");
     var local = readJSON(SETTINGS, {}), args = YTSubs.args(typeof $argument !== "undefined" ? $argument : null);
+    // The key never joins cfg, so it cannot reach the pending snapshot or any log line.
+    var pluginKey = String(args.api_key || "").trim(); delete args.api_key;
     var cfg = Object.assign({enabled: false, target: "zh-Hans", model: "deepseek-flash", start_seconds: 0, concurrency: 8, max_calls: 0}, local, args);
     if (prewarm) cfg = Object.assign(cfg, snapshot.cfg, {enabled: true, start_seconds: 0, max_calls: 0});
     concurrency = Number(cfg.concurrency);
@@ -572,8 +574,16 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
       }
     }
     if (!missing.length) return finish("CACHE_OR_NO_ELIGIBLE_CUES");
-    var apiKey = String(read(KEY) || "").trim();
+    // A key typed in the plugin settings wins; it is copied to local storage so the prewarm script can reuse it.
+    // A changed key also clears the cooldown, so fixing a mistyped key works without waiting out the auth penalty.
+    if (pluginKey && !/^[A-Za-z0-9._~+\/=-]{8,256}$/.test(pluginKey)) return finish("BAD_PLUGIN_KEY");
+    if (pluginKey && read(KEY) !== pluginKey) {
+      if (write(KEY, pluginKey)) write(COOLDOWN, undefined);
+      else log("key_write_failed");
+    }
+    var apiKey = pluginKey || String(read(KEY) || "").trim();
     if (!apiKey || /[\s\r\n]/.test(apiKey) || apiKey.indexOf("PASTE_") === 0) return finish("NO_LOCAL_KEY");
+    keySource = pluginKey ? "plugin" : "local";
     if (Number(read(COOLDOWN)) > Date.now()) return finish("COOLDOWN");
     // Every batch remains eligible; time and concurrency, not price, bound execution.
     var batches = [], recovery = [];

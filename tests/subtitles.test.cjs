@@ -123,6 +123,39 @@ test('valid API result is merged; key and signed URL never appear in logs/cache/
     assert.equal(text.includes('TEST_ONLY_NOT_A_REAL_CREDENTIAL'), false); assert.equal(text.includes('PRIVATE_SENTINEL'), false);
   }
 });
+test('plugin-setting key is used, saved for prewarm, and never logged', () => {
+  const h = harness('translate', {store: {'ytloon.deepseek.key': ''}, args: {enabled: true, max_calls: 4, concurrency: 2, api_key: ' sk-PLUGIN_ONLY_TEST_KEY '}});
+  assert.equal(h.calls.length, 1); assert.equal(h.calls[0].options.headers.Authorization, 'Bearer sk-PLUGIN_ONLY_TEST_KEY');
+  assert.equal(h.store['ytloon.deepseek.key'], 'sk-PLUGIN_ONLY_TEST_KEY');
+  h.respond();
+  const logs = h.logs.join(' ');
+  assert.ok(logs.includes('key=plugin')); assert.equal(logs.includes('PLUGIN_ONLY_TEST_KEY'), false);
+  assert.equal(h.store['ytloon.pending.v1'].includes('PLUGIN_ONLY_TEST_KEY'), false);
+});
+test('changing the plugin-setting key clears the auth cooldown; an unchanged key keeps it', () => {
+  const until = String(Date.now() + 300000), args = {enabled: true, max_calls: 4, concurrency: 2, api_key: 'sk-FIXED_PLUGIN_KEY'};
+  assert.equal(harness('translate', {store: {'ytloon.cooldown.v1': until}, args}).calls.length, 1);
+  const same = harness('translate', {store: {'ytloon.deepseek.key': 'sk-FIXED_PLUGIN_KEY', 'ytloon.cooldown.v1': until}, args});
+  assert.equal(same.calls.length, 0); assert.ok(same.logs.some(s => s.includes('result=COOLDOWN')));
+});
+test('plugin-setting key overrides the stored key; empty setting falls back to it', () => {
+  const a = harness('translate', {args: {enabled: true, max_calls: 4, concurrency: 2, api_key: 'sk-NEW_PLUGIN_KEY'}});
+  assert.equal(a.calls[0].options.headers.Authorization, 'Bearer sk-NEW_PLUGIN_KEY');
+  const b = harness('translate', {args: {enabled: true, max_calls: 4, concurrency: 2, api_key: ''}});
+  assert.equal(b.calls[0].options.headers.Authorization, 'Bearer TEST_ONLY_NOT_A_REAL_CREDENTIAL');
+  b.respond(); assert.ok(b.logs.some(s => s.includes('key=local')));
+});
+test('malformed plugin-setting key causes zero requests and is not logged or saved', () => {
+  const h = harness('translate', {args: {enabled: true, max_calls: 4, concurrency: 2, api_key: 'sk-BAD KEY_SENTINEL'}});
+  assert.equal(h.calls.length, 0); assert.deepEqual(h.results, [{}]);
+  assert.ok(h.logs.some(s => s.includes('result=BAD_PLUGIN_KEY')));
+  assert.equal(h.logs.join(' ').includes('KEY_SENTINEL'), false);
+  assert.equal(h.store['ytloon.deepseek.key'], 'TEST_ONLY_NOT_A_REAL_CREDENTIAL');
+});
+test('translate plugin exposes an empty Key setting and passes it to the script', () => {
+  const plugin = fs.readFileSync(path.join(root, 'plugins/YouTube-translate.plugin'), 'utf8');
+  assert.ok(plugin.includes('api_key = input,"",type=string')); assert.ok(plugin.includes('${api_key}}'));
+});
 test('cached replay requires zero HTTP requests even after key is removed', () => {
   const a = harness(); a.respond();
   const b = harness('translate', {store: Object.assign({}, a.store, {'ytloon.deepseek.key': ''})});
