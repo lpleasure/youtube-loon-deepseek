@@ -1,4 +1,4 @@
-/* YT Loon 1.3.0. Generated: edit src/, run npm run build. */
+/* YT Loon 1.3.1. Generated: edit src/, run npm run build. */
 /* Original implementation. No dependencies; shared by Node tests and Loon bundles. */
 var YTSubs = (function () {
   "use strict";
@@ -433,7 +433,7 @@ var YTSubs = (function () {
     cues.forEach(function (c) {
       var key = c.startSeconds + "|" + c.text;
       if (groups[key]) return groups[key].ids.push(c.id);
-      spans.push(groups[key] = {ids: [c.id], start: c.startSeconds, end: Number.isFinite(c.endSeconds) ? c.endSeconds : Infinity, texts: []});
+      spans.push(groups[key] = {ids: [c.id], start: c.startSeconds, end: Number.isFinite(c.endSeconds) ? c.endSeconds : Infinity, picked: []});
     });
     spans.sort(function (a, b) { return a.start - b.start || a.ids[0] - b.ids[0]; });
     spans.forEach(function (s, i) {
@@ -454,19 +454,34 @@ var YTSubs = (function () {
     // on-screen text notes the source track does not carry; they are left out.
     Object.keys(windows).forEach(function (w) { if (!main || windows[w] > windows[main]) main = w; });
     var dialogue = items.filter(function (n) { return n.window === main; });
-    items.forEach(function (n) {
-      if (n.window !== main && dialogue.some(function (d) { return Math.min(d.end, n.end) - Math.max(d.start, n.start) > (n.end - n.start) / 2; })) return;
-      var mid = (n.start + n.end) / 2, lo = 0, hi = spans.length - 1, at = -1, best = null, most = 0;
-      while (lo <= hi) { var m = (lo + hi) >> 1; if (spans[m].start <= mid) { at = m; lo = m + 1; } else hi = m - 1; }
+    var kept = items.filter(function (n) {
+      return n.window === main || !dialogue.some(function (d) { return Math.min(d.end, n.end) - Math.max(d.start, n.start) > (n.end - n.start) / 2; });
+    }).sort(function (a, b) { return a.start - b.start; });
+    function last(list, time) {
+      var lo = 0, hi = list.length - 1, at = -1;
+      while (lo <= hi) { var m = (lo + hi) >> 1; if (list[m].start <= time) { at = m; lo = m + 1; } else hi = m - 1; }
+      return at;
+    }
+    function pick(s, n) { if (s.picked.indexOf(n) < 0) s.picked.push(n); }
+    kept.forEach(function (n) {
+      var mid = (n.start + n.end) / 2, at = last(spans, mid), best = null, most = 0;
       if (at >= 0 && mid < spans[at].end) best = spans[at];
       else [spans[at], spans[at + 1]].forEach(function (s) {
         var overlap = s ? Math.min(s.end, n.end) - Math.max(s.start, n.start) : 0;
         if (overlap > most) { most = overlap; best = s; }
       });
-      if (best && best.texts[best.texts.length - 1] !== n.text) best.texts.push(n.text);
+      if (best) pick(best, n);
+    });
+    // Translators often merge two short source lines into one native cue. Such a cue also goes to
+    // every source cue whose midpoint it covers, so the earlier line does not stay source-only.
+    spans.forEach(function (s) {
+      var mid = (s.start + s.end) / 2;
+      for (var j = last(kept, mid), k = 0; j >= 0 && k < 4; j--, k++) if (kept[j].end > mid) pick(s, kept[j]);
     });
     spans.forEach(function (s) {
-      if (s.texts.length) s.ids.forEach(function (id) { out[id] = s.texts.join(" ").slice(0, 1600); });
+      var texts = s.picked.sort(function (a, b) { return a.start - b.start; }).map(function (n) { return n.text; });
+      texts = texts.filter(function (t, i) { return t !== texts[i - 1]; });
+      if (texts.length) s.ids.forEach(function (id) { out[id] = texts.join(" ").slice(0, 1600); });
     });
     return out;
   }
@@ -585,7 +600,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = YTSubs;
       if (!prewarm && doc && Object.keys(translations).length) response = {body: doc.render(translations), headers: YTSubs.headers(responseContext.headers)};
     } catch (_) { response = {}; reason = "OUTPUT_ERROR"; }
     if (lockValue && read(LOCK + track) === lockValue) write(LOCK + track, undefined);
-    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + (native ? " native=" + native : "") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.3.0 elapsed_ms=" + (Date.now() - started));
+    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + (native ? " native=" + native : "") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.3.1 elapsed_ms=" + (Date.now() - started));
     $done(response);
   }
   function header(headers, name) {
