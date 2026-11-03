@@ -1,4 +1,4 @@
-/* YT Loon 1.3.1. Generated: edit src/, run npm run build. */
+/* YT Loon 1.3.2. Generated: edit src/, run npm run build. */
 /* Original implementation. No dependencies; shared by Node tests and Loon bundles. */
 var YTSubs = (function () {
   "use strict";
@@ -507,8 +507,8 @@ var YTSubsPrewarm = true;
   var LEGACY_CACHE = "ytloon.cache.v1", INDEX = "ytloon.index.v2", SHARD = "ytloon.shard.v2.", LOCK = "ytloon.lock.v2.";
   var CACHE_TTL = 7 * 86400000, CACHE_BUDGET = 6291456, MAX_SHARDS = 400, CHECKPOINT = 96, WAIT_MS = 1000;
   // Marks this script's own native-track requests; a URL parameter would void YouTube's signature.
-  var NATIVE_HEADER = "X-YTLoon", NATIVE_MS = 5000;
-  var done = false, keySource = "none", timer, doc, track, lockValue, stored, native = "", translations = {}, additions = [], started = Date.now(), waitedMS = 0, trackEntries = 0;
+  var NATIVE_HEADER = "X-YTLoon", NATIVE_MS = 2500;
+  var done = false, keySource = "none", timer, doc, track, lockValue, stored, native = "", nativeMS = 0, translations = {}, additions = [], started = Date.now(), waitedMS = 0, trackEntries = 0;
   // shardNative: language a shard records as having no native track; noNative: newly confirmed now.
   var shardNative, noNative;
   var counts = {cached: 0, sent: 0, translated: 0, failed: 0};
@@ -601,7 +601,7 @@ var YTSubsPrewarm = true;
       if (!prewarm && doc && Object.keys(translations).length) response = {body: doc.render(translations), headers: YTSubs.headers(responseContext.headers)};
     } catch (_) { response = {}; reason = "OUTPUT_ERROR"; }
     if (lockValue && read(LOCK + track) === lockValue) write(LOCK + track, undefined);
-    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + (native ? " native=" + native : "") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.3.1 elapsed_ms=" + (Date.now() - started));
+    log("result=" + reason + " mode=" + (prewarm ? "prewarm" : "response") + " total=" + (doc ? doc.cues.length : 0) + " format=" + (doc ? doc.format : "unknown") + " sentence=" + (doc && doc.sentenceMode || "fallback") + (native ? " native=" + native + " native_ms=" + nativeMS : "") + " cached=" + counts.cached + " sent=" + counts.sent + " translated=" + counts.translated + " failed=" + counts.failed + " untranslated=" + (doc ? doc.cues.length - Object.keys(translations).length : 0) + " track_cached=" + trackEntries + " waited_ms=" + waitedMS + " body_kb=" + Math.round(String(responseContext.body || "").length / 1024) + " key=" + keySource + " version=1.3.2 elapsed_ms=" + (Date.now() - started));
     $done(response);
   }
   function header(headers, name) {
@@ -646,36 +646,49 @@ var YTSubsPrewarm = true;
   function fetchNative(next) {
     var langs = [cfg.target].concat(YTSubs.primaryLanguage(cfg.target) === "zh" ? ["zh-Hans", "zh-Hant", "zh-CN", "zh-TW", "zh-HK", "zh"] : []), seen = {};
     langs = langs.filter(function (lang) { var k = lang.toLowerCase(); return !seen[k] && (seen[k] = true); });
-    var bodies = [], pending = langs.length, ua = header(requestContext.headers, "User-Agent");
+    // states[i]: pending, empty (200 with no track), content, unusable, error or timeout.
+    var states = langs.map(function () { return "pending"; }), bodies = [], decided = false, probeStart = Date.now(), ua = header(requestContext.headers, "User-Agent");
     langs.forEach(function (lang, i) {
-      var settled = false, wait = setTimeout(function () { settle(null); }, NATIVE_MS);
-      function settle(body) {
-        if (settled) return;
-        settled = true;
+      if (decided) return;
+      var wait = setTimeout(function () { settle("timeout", null); }, NATIVE_MS);
+      function settle(state, body) {
         if (typeof clearTimeout === "function") clearTimeout(wait);
-        bodies[i] = body;
-        if (--pending === 0) pick();
+        if (decided || states[i] !== "pending") return; // Late answers after a decision change nothing.
+        states[i] = body && body.trim() ? "content" : state;
+        bodies[i] = states[i] === "content" ? body : null;
+        decide();
       }
       var headers = {}; headers[NATIVE_HEADER] = "native"; if (ua) headers["User-Agent"] = ua;
       try {
         $httpClient.get({url: YTSubs.nativeURL(requestContext.url, lang), timeout: NATIVE_MS, headers: headers}, function (error, response, data) {
-          // An empty 200 means YouTube has no such track; errors and timeouts settle as null.
-          settle(!error && YTSubs.statusOK(response) && typeof data === "string" ? data : null);
+          if (!error && YTSubs.statusOK(response) && typeof data === "string") settle("empty", data);
+          else settle("error", null);
         });
-      } catch (_) { settle(null); }
+      } catch (_) { settle("error", null); }
     });
-    function pick() {
-      if (done) return;
+    // Decides as soon as the preferred available language is known: a higher-priority probe that
+    // is still pending is waited for (at most NATIVE_MS); lower-priority ones are not.
+    function decide() {
+      if (decided || done) return;
       for (var i = 0; i < langs.length; i++) {
-        if (!bodies[i] || !bodies[i].trim()) continue;
+        if (states[i] === "pending") return;
+        if (states[i] !== "content") continue;
         try {
           var aligned = YTSubs.alignNative(doc.cues, YTSubs.parse(bodies[i]).cues), matched = Object.keys(aligned).length;
-          if (matched) { bodies = null; translations = aligned; native = langs[i] + ":" + matched; return finish("NATIVE"); }
+          if (matched) {
+            decided = true; bodies = null; translations = aligned; native = langs[i] + ":" + matched; nativeMS = Date.now() - probeStart;
+            return finish("NATIVE");
+          }
         } catch (_) {}
+        states[i] = "unusable"; bodies[i] = null;
       }
+      decided = true; bodies = null; nativeMS = Date.now() - probeStart;
       // Only when every probe answered empty is the video known to lack a native track.
-      if (bodies.every(function (b) { return typeof b === "string" && !b.trim(); })) noNative = YTSubs.primaryLanguage(cfg.target);
-      bodies = null;
+      if (states.every(function (s) { return s === "empty"; })) { noNative = YTSubs.primaryLanguage(cfg.target); native = "none"; }
+      else native = ["timeout", "error", "unusable"].map(function (kind) {
+        var hit = langs.filter(function (lang, i) { return states[i] === kind; });
+        return hit.length ? kind + ":" + hit.join(",") : "";
+      }).filter(Boolean).join(";");
       next();
     }
   }
