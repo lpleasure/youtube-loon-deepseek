@@ -859,16 +859,35 @@ test('native track prefers Simplified, falls back to Traditional, then to DeepSe
  const hant=harness('translate',{body:nativeEnglish(),native:{'zh-Hant':nativeChinese().replace('其他人','其他人(繁)')}});
  assert.ok(nativeTexts(hant).join().includes('(繁)'));assert.ok(hant.logs.some(s=>s.includes('native=zh-Hant:3')));
  const none=harness('translate',{body:nativeEnglish()});assert.equal(none.calls.length,1);none.respond();
- assert.ok(none.results[0].body.includes('译文'));assert.equal(none.logs.some(s=>s.includes('native=')),false);
+ assert.ok(none.results[0].body.includes('译文'));assert.ok(none.logs.some(s=>/ native=none native_ms=\d+ /.test(s)));
  assert.deepEqual(none.gets.map(g=>new URL(g.options.url).searchParams.get('lang')),['zh-Hans','zh-Hant','zh-CN','zh-TW','zh-HK','zh']);
  const ja=harness('translate',{body:nativeEnglish(),args:{enabled:true,target:'ja'}});assert.deepEqual(ja.gets.map(g=>new URL(g.options.url).searchParams.get('lang')),['ja']);
 });
 test('slow or failing native probes fall back to DeepSeek after the probe timeout',()=>{
  const h=harness('translate',{body:nativeEnglish(),holdNative:true});assert.equal(h.calls.length,0);
- h.gets[0].cb('ETIMEDOUT',null,null);h.advance(4999);assert.equal(h.calls.length,0);
+ h.gets[0].cb('ETIMEDOUT',null,null);for(const g of h.gets.slice(2)) g.cb(null,{status:200},'');
+ h.advance(2499);assert.equal(h.calls.length,0);
  h.advance(1);assert.equal(h.calls.length,1);h.gets[1].cb(null,{status:200},nativeChinese());
  h.respond();assert.ok(h.results[0].body.includes('译文'));assert.equal(h.results.length,1);
+ assert.ok(h.logs.some(s=>/ native=timeout:zh-Hant;error:zh-Hans native_ms=2500 /.test(s)));
  const broken=harness('translate',{body:nativeEnglish(),native:{'zh-Hans':'<html>not subtitles</html>'}});assert.equal(broken.calls.length,1);
+ broken.respond();assert.ok(broken.logs.some(s=>s.includes(' native=unusable:zh-Hans ')));
+});
+test('native probes decide as soon as the preferred available language is known',()=>{
+ const hant=nativeChinese().replace('其他人','其他人(繁)');
+ // Simplified answers first: used at once, lower-priority probes are not waited for.
+ const fast=harness('translate',{body:nativeEnglish(),holdNative:true});fast.gets[0].cb(null,{status:200},nativeChinese());
+ assert.equal(fast.results.length,1);assert.ok(fast.logs.some(s=>/result=NATIVE .* native=zh-Hans:3 native_ms=0 /.test(s)));
+ // Simplified is empty, Traditional has content: used without waiting for zh-CN and the rest.
+ const next=harness('translate',{body:nativeEnglish(),holdNative:true});next.gets[1].cb(null,{status:200},hant);
+ assert.equal(next.results.length,0);next.gets[0].cb(null,{status:200},'');
+ assert.equal(next.results.length,1);assert.ok(nativeTexts(next).join().includes('(繁)'));
+ // Simplified still pending: Traditional waits for it, at most the probe timeout.
+ const wait=harness('translate',{body:nativeEnglish(),holdNative:true});wait.gets[1].cb(null,{status:200},hant);
+ wait.advance(2499);assert.equal(wait.results.length,0);wait.advance(1);
+ assert.equal(wait.results.length,1);assert.ok(wait.logs.some(s=>s.includes('native=zh-Hant:3 native_ms=2500')));
+ // A late Simplified answer after the decision changes nothing.
+ wait.gets[0].cb(null,{status:200},nativeChinese());assert.equal(wait.results.length,1);
 });
 test('the script passes its own native probe through and prewarm never probes',()=>{
  const probe=harness('translate',{body:nativeChinese(),requestHeaders:{'x-ytloon':'native'}});
